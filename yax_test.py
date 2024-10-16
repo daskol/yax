@@ -1,19 +1,24 @@
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+import pytest
 from jax import Array
 
-from yax import find_modules, trace
+from yax import mox
+
+
+def test_mox_add():
+    xs = jnp.ones(3)
+    ys = jnp.ones(3)
+    mtree = mox(lambda x, y: x + y)(xs, ys)
+    print(mtree)
+    assert mtree.children == []
 
 
 class AddModule(nn.Module):
 
     @nn.compact
     def __call__(self, xs: Array, ys: Array) -> Array:
-        print(self.__class__.__name__)
-        print(xs)
-        print(ys)
-        find_modules()
         return xs + ys
 
 
@@ -21,23 +26,48 @@ class ContainerModule(nn.Module):
 
     @nn.compact
     def __call__(self, xs: Array, ys: Array) -> Array:
-        print(self.__class__.__name__)
-        find_modules()
-        zs = AddModule()(xs, ys)
-        print('zs =', zs)
-        return ys * zs
+        return xs * AddModule()(xs, ys)
 
 
-def test_trace_add():
+def test_mox_trivial():
     xs = jnp.ones(3)
     ys = jnp.ones(3)
     key = jax.random.PRNGKey(42)
     model = ContainerModule()
     params = jax.jit(model.init)(key, xs, ys)
 
-    res = trace(model.apply)(params, xs, ys)
-    print(res)
+    mtree = mox(model.apply)(params, xs, ys)
+    print(mtree)
 
 
-if __name__ == '__main__':
-    test_trace_add()
+class ResidualBlock(nn.Module):
+    @nn.compact
+    def __call__(self, xs: Array) -> Array:
+        return xs + nn.Dense(4)(xs)
+
+
+def test_residual():
+    xs = jnp.ones(4)
+    key = jax.random.PRNGKey(42)
+    model = ResidualBlock()
+    params = jax.jit(model.init)(key, xs)
+
+    mtree = mox(model.apply)(params, xs)
+    print(mtree)
+
+
+@pytest.mark.slow
+class TestHFModels:
+
+    def test_roberta(self):
+        from os import environ
+        environ['USE_FLAX'] = '1'
+        environ['USE_TORCH'] = '0'
+
+        from transformers import FlaxRobertaForSequenceClassification
+        model = FlaxRobertaForSequenceClassification \
+            .from_pretrained('roberta-base')
+
+        input_ids = jnp.ones((1, 3), dtype=jnp.int32)
+        mtree = mox(model)(input_ids)
+        print(mtree)
