@@ -64,8 +64,6 @@ class ModuleTrace(Trace):
         return ModuleTracer(self, val)
 
     def process_primitive(self, prim: jex.core.Primitive, tracers, params):
-        print(f'process_primitive(prim={prim})')
-        logger.debug('tracers=%s; params=%s', tracers, params)
         result, _ = prim.abstract_eval(*[x.aval for x in tracers], **params)
         # TODO(@daskol): Add tracers too?
         if prim.multiple_results:
@@ -103,6 +101,12 @@ def trace_modules(wf: lu.WrappedFun, builder: 'MoxBuilder') -> lu.WrappedFun:
 @dataclass(slots=True)
 class Symbol:
     aval: ShapedArray
+
+    def __eq__(self, other) -> bool:
+        return self is other
+
+    def __hash__(self) -> int:
+        return id(self)
 
 
 @dataclass(slots=True)
@@ -230,14 +234,6 @@ class MoxBuilder:
     def append(self, prim: jex.core.Primitive, params: dict[str, Any],
                in_tracers: list[ModuleTracer],
                out_tracers: list[ModuleTracer]):
-        # Some models are not inhereted from `flax.linen.Module`. They define
-        # an aggregate type on top of `flax.linen.Module` (e.g. HuggingFace
-        # `trasnformers`). Thus, there are some ops which are outside of
-        # module.
-        if len(self.module_stack) == 0:
-            print(f'primitive {prim} does not have root module')
-            return
-
         in_symbols = self.to_symbols(in_tracers)
         out_symbols = self.to_symbols(out_tracers)
         eq = Equation(in_symbols, out_symbols, params, prim)
@@ -250,10 +246,8 @@ class MoxBuilder:
         self.root.inputs.extend(self.to_symbols(tracers))
 
     def set_outputs(self, tracers: Sequence[ModuleTracer] | ModuleTracer):
-        print(tracers)
         if not isinstance(tracers, list | tuple | Sequence):
             tracers = [tracers]
-        print(tracers)
         self.root.outputs.clear()
         self.root.outputs.extend(self.to_symbols(tracers))
 
@@ -312,8 +306,61 @@ class XPath:
     """XPath expression."""
 
 
+def eval_module(read, write, mox: Mox, in_tree) -> None:
+    pass
+
+
+def eval_equation(read, write, eq: Equation) -> None:
+    in_vals = [read(x) for x in eq.inputs]  # TODO(@daskol): Trees?
+    subfuns, params = eq.prim.get_bind_params(eq.params)
+    out_vals = eq.prim.bind(*subfuns, *in_vals, **params)
+    if not eq.prim.multiple_results:
+        out_vals = [out_vals]
+    for sym, val in zip(eq.outputs, out_vals):
+        write(sym, val)
+
+
+def mtree_eval(tree: Mox, *args, **kwargs):
+    """Evaluate a module expression `tree` with `args` and `kwargs`."""
+    Var = Any
+    env: dict[Var, Any] = {}
+
+    def read(var: Var) -> Any:
+        return env[var]
+
+    def write(var: Var, val: Any):
+        assert var not in env, f'Variable {var} has been already defined.'
+        env[var] = val
+
+    def fn(node: Expr) -> Mox | None:
+        if isinstance(node, Mox):
+            if node.is_ephemeral:
+                return node
+            else:
+                return eval_module(read, write, node, in_tree)
+        elif isinstance(node, Equation):
+            return eval_equation(read, write, node)
+
+    # Initialize execution context and execute.
+    # TODO(@daskol): Use `in_tree`.
+    flatten_args, in_tree = jax.tree.flatten(args)
+    for symbol, value in zip(tree.inputs, flatten_args):
+        write(symbol, value)
+    mtree_map(fn, tree)
+
+    flatten_res = [read(x) for x in tree.outputs]
+    if len(flatten_res) == 1:
+        return flatten_res[0]
+    return flatten_res
+
+
 def mtree_map(fn: Callable[[Expr], Any], tree: Mox):
     """Apply map transformation `fn` to a module `tree`."""
+    nodes = [tree]
+    while nodes:
+        node: Expr = nodes.pop()
+        if isinstance(res := fn(node), Mox):
+            nodes += res.children
 
 
 def mtree_sub(expr: str | XPath, tree: Mox, subtree: Mox) -> Mox:
