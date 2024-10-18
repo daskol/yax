@@ -202,11 +202,6 @@ class MoxBuilder:
     def intercept(self, fn: Callable[..., Any], args, kwargs,
                   context: InterceptorContext) -> Any:
         """A hook to intercept call of `flax.linen.Module` method."""
-        # https://github.com/google/flax/pull/1443/files
-        self.module_stack += [context]
-        mpath = self.get_module_path()
-        logger.debug('enter %s (%s)', type(context.module).__qualname__, mpath)
-
         in_syms = self.to_symbols(args)
         out_syms = []  # TODO(@daskol): Should we run nested tracer?
         # TODO(@daskol): How to flatten in abstract way?
@@ -224,12 +219,18 @@ class MoxBuilder:
         self.block_stack += [child]
 
         # Forward call further and its result as is.
-        result = fn(*args, **kwargs)
+        results = fn(*args, **kwargs)
 
-        logger.debug('exit  %s (%s)', type(context.module).__qualname__, mpath)
+        # TODO(@daskol): Should we introduce `flax_p` primitive here? Or just
+        # flatten outputs?
+        multiple_results = not isinstance(results, Tracer)
+        if multiple_results:
+            child.outputs.extend(self.to_symbols(results))
+        else:
+            child.outputs.extend(self.to_symbols([results]))
+
         self.block_stack.pop()
-        self.module_stack.pop()
-        return result
+        return results
 
     def append(self, prim: jex.core.Primitive, params: dict[str, Any],
                in_tracers: list[ModuleTracer],

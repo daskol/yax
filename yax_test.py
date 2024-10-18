@@ -1,6 +1,6 @@
 import operator
 from dataclasses import astuple, dataclass
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import flax.linen as nn
 import jax
@@ -19,6 +19,7 @@ from yax import Equation, Mox, mox, mtree_eval
     pytest.param(operator.sub, id='sub'),
 ])
 class TestBinaryFunc:
+    """Test building and evaluation MoX of binary functions."""
 
     def test_make(self, fn):
         xs = jnp.ones(3)
@@ -61,29 +62,48 @@ class ModelState:
         return astuple(self)
 
 
-class AddModule(nn.Module):
+class FuncModule(nn.Module):
+    binary_fn: Callable[[Array, Array], Array]
 
     @nn.compact
     def __call__(self, xs: Array, ys: Array) -> Array:
-        return xs + ys
+        return self.binary_fn(xs, ys)
 
 
-class ContainerModule(nn.Module):
+@pytest.mark.parametrize('fn', [
+    pytest.param(operator.add, id='add'),
+    pytest.param(operator.mul, id='mul'),
+    pytest.param(operator.sub, id='sub'),
+])
+class TestBinaryModule:
+    """Test building and evaluation MoX of simple weightless
+    :class:`flax.linen.Module` with two inputs and single output.
+    """
 
-    @nn.compact
-    def __call__(self, xs: Array, ys: Array) -> Array:
-        return xs * AddModule()(xs, ys)
+    def test_make(self, fn):
+        key = jax.random.PRNGKey(42)
+        batch = (jnp.ones(4), jnp.ones(4))
+        model = FuncModule(fn)
+        params = jax.jit(model.init)(key, *batch)
 
+        mtree = mox(model.apply)(params, *batch)
+        assert isinstance(mtree, Mox)
+        assert mtree.is_ephemeral
+        assert len(mtree.children) == 1
+        assert isinstance(mtree.children[0], Mox)
 
-def test_mox_trivial():
-    xs = jnp.ones(3)
-    ys = jnp.ones(3)
-    key = jax.random.PRNGKey(42)
-    model = ContainerModule()
-    params = jax.jit(model.init)(key, xs, ys)
+        subtree: Mox = mtree.children[0]
+        assert not subtree.is_ephemeral
+        assert len(subtree.inputs) == 2
+        assert len(subtree.outputs) == 1
 
-    mtree = mox(model.apply)(params, xs, ys)
-    print(mtree)
+    def test_eval(self, fn):
+        xs = jnp.ones(3)
+        ys = jnp.ones(3)
+        mtree = mox(fn)(xs, ys)
+        actual = mtree_eval(mtree, xs, ys)
+        desired = fn(xs, ys)
+        assert_allclose(actual, desired)
 
 
 class ResBlock(nn.Module):
