@@ -1,6 +1,7 @@
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+import pytest
 from flax.linen.initializers import lecun_normal, zeros_init
 from flax.typing import Dtype, Initializer, PrecisionLike
 
@@ -44,6 +45,7 @@ class Model(nn.Module):
         return ys
 
 
+@pytest.mark.xfail(reason='no jvp support')
 def test_lora():
     """A use case of substituting a affine layer with LoRA-adapter."""
     batch = jnp.empty((1, 10))

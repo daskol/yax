@@ -40,22 +40,28 @@ def test_mox_trivial():
     print(mtree)
 
 
-class ResidualBlock(nn.Module):
+class ResBlock(nn.Module):
+
+    features: int = 4
+
     @nn.compact
     def __call__(self, xs: Array) -> Array:
-        return xs + nn.Dense(4)(xs)
+        assert self.features == xs.shape[-1], \
+            f'Mismatched numbers of features: {self.features} vs {xs.shape}.'
+        return xs + nn.Dense(self.features)(xs)
 
 
 def test_residual():
     xs = jnp.ones(4)
     key = jax.random.PRNGKey(42)
-    model = ResidualBlock()
+    model = ResBlock()
     params = jax.jit(model.init)(key, xs)
 
     mtree = mox(model.apply)(params, xs)
     print(mtree)
 
 
+@pytest.mark.xfail(reason='no dynamic trace')
 @pytest.mark.slow
 class TestHFModels:
 

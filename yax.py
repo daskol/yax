@@ -6,15 +6,17 @@ import logging
 from dataclasses import dataclass, field, fields
 from functools import wraps
 from io import StringIO
-from typing import Any, ParamSpec, Self, Sequence, Type, TypeAlias
+from typing import IO, Any, ParamSpec, Sequence, Type
 
 import flax.linen as nn
 import jax
 import jax.extend as jex
 import jax.extend.linear_util as lu
-import jax.numpy as jnp
 from flax.linen.module import Callable, InterceptorContext, intercept_methods
-from jax.core import MainTrace, Sublevel, Trace, Tracer, new_main
+from jax.core import MainTrace, ShapedArray, Sublevel, Trace, Tracer, new_main
+
+__all__ = ('Equation', 'Expr', 'Literal', 'Mox', 'Var', 'Symbol', 'mox',
+           'mtree_map', 'mtree_query', 'mtree_sub')
 
 # TODO(@daskol): Python 3.12 introduced new type parameter syntax (PEP-0695)
 # but some code quality tools (e.g. yapf) do not support this syntax.
@@ -25,9 +27,17 @@ logger = logging.getLogger(__name__)
 
 class ModuleTracer(Tracer):
 
+    __slots__ = 'value'
+
     def __init__(self, trace: Trace, value):
         super().__init__(trace)
         self.value = value
+
+    def __hash__(self) -> int:
+        return id(self)
+
+    def __eq__(self, other) -> bool:
+        return self is other
 
     @property
     def aval(self):
@@ -37,7 +47,8 @@ class ModuleTracer(Tracer):
     def full_lower(self):
         # TODO(@daskol): Full lower to some abstract array type.
         # return jax.core.full_lower(self.value)
-        return jnp.empty(self.value.shape, self.value.dtype)
+        assert isinstance(self, Tracer)
+        return self
 
 
 class ModuleTrace(Trace):
@@ -55,20 +66,24 @@ class ModuleTrace(Trace):
     def process_primitive(self, prim: jex.core.Primitive, tracers, params):
         print(f'process_primitive(prim={prim})')
         logger.debug('tracers=%s; params=%s', tracers, params)
-        outs, _ = prim.abstract_eval(*[x.aval for x in tracers], **params)
+        result, _ = prim.abstract_eval(*[x.aval for x in tracers], **params)
         # TODO(@daskol): Add tracers too?
-        self.builder.append(prim, tracers, params)
         if prim.multiple_results:
-            return [ModuleTracer(self, out) for out in outs]
+            out_tracers = [ModuleTracer(self, out) for out in result]
+            self.builder.append(prim, params, tracers, out_tracers)
         else:
-            return ModuleTracer(self, outs)
+            out_tracers = ModuleTracer(self, result)
+            self.builder.append(prim, params, tracers, [out_tracers])
+        return out_tracers
 
 
 @lu.transformation
-def _lower(main: MainTrace, *ins):
+def _lower(builder: 'MoxBuilder', main: MainTrace, *ins):
     trace: ModuleTrace = main.with_cur_sublevel()
     in_tracers = [trace.lift(x) for x in ins]
+    builder.set_inputs(in_tracers)
     out_tracers = yield in_tracers, {}
+    builder.set_outputs(out_tracers)
     outs = [trace.full_raise(x).value for x in out_tracers]
     yield outs
 
@@ -82,71 +97,59 @@ def _raise(builder, *ins):
 
 
 def trace_modules(wf: lu.WrappedFun, builder: 'MoxBuilder') -> lu.WrappedFun:
-    return _raise(_lower(wf), builder)
+    return _raise(_lower(wf, builder), builder)
 
 
-@dataclass(repr=False)
-class Block:
-    """Linear block of code.
-
-    Args:
-      module:
-      entrypoint:
-      attrs:
-      children:
-    """
-
-    # TODO(@daskol): Multiple invokations of the same block produces metadata
-    # duplication, i.e. module_ty and attrs (and entrypoint sometimes).
-
-    module_ty: Type[nn.Module]
-
-    entrypoint: str
-
-    attrs: dict[str, Any]
-
-    children: list['Block', 'Instr'] = field(default_factory=list)
-
-    # def __eq__(self, other):
-    #     pass
-
-    def __hash__(self):
-        return id(self.module)
-
-    def __repr__(self):
-        name = f'{self.module_ty.__module__}.{self.module_ty.__qualname__}'
-        return name
-
-    @classmethod
-    def from_interceptor_context(cls, context: InterceptorContext) -> Self:
-        # It is important to access `__dict__` directly since `__getattr__` is
-        # overriden.
-        attrs = {f.name: context.module.__dict__.get(f.name)
-                 for f in fields(context.module) if f.name != 'parent'}
-        return cls(type(context.module), context.method_name, attrs)
+@dataclass(slots=True)
+class Symbol:
+    aval: ShapedArray
 
 
-@dataclass
-class Instr:
+@dataclass(slots=True)
+class Var(Symbol):
+    pass
 
-    name: str
+
+@dataclass(init=False, slots=True)
+class Literal(Symbol):
+    value: Any
+
+    def __init__(self, value: Any, aval: ShapedArray | None = None):
+        if aval is None:
+            aval = ...  # TODO(@daskol): Get shaped.
+        super().__init__(aval)
+        self.value = value
 
 
-@dataclass(repr=False)
-class Root:
+@dataclass(slots=True)
+class Expr:
+    inputs: list[Symbol]
+    outputs: list[Var]
+    params: dict[str, Any]
 
-    children: list[Block | Instr] = field(default_factory=list)
 
-    def __repr__(self):
+@dataclass(slots=True)
+class Equation(Expr):
+    prim: jex.core.Primitive
+
+
+@dataclass(repr=False, slots=True)
+class Mox(Expr):
+    children: list[Expr] = field(default_factory=list)
+    module_ty: Type[nn.Module] | None = None
+    entrypoint: str | None = None
+
+    @property
+    def is_ephemeral(self) -> bool:
+        """Ephemeral module expression does not reflect any real
+        :class:`flax.linen.Module`.
+        """
+        return self.module_ty is None or self.entrypoint is None
+
+    def __repr__(self) -> str:
         buf = StringIO()
-        print_node(self, fileobj=buf)
+        dump(self, buf)
         return buf.getvalue()
-
-
-Node: TypeAlias = Block | Instr | Root
-
-# TODO(@daskol): Root node should be an internal node?
-Mox: TypeAlias = Root
 
 
 def mox(fn: Callable[Args, Any]) -> Callable[Args, Mox]:
@@ -161,43 +164,29 @@ def mox(fn: Callable[Args, Any]) -> Callable[Args, Mox]:
     @wraps(fn)
     def wrapper(*args: Args.args, **kwargs: Args.kwargs) -> Mox:
         wf = lu.wrap_init(fn)
-        logger.debug(wf)
-        logger.debug('=' * 80)
         in_args, in_tree = jax.tree.flatten((args, kwargs))
+        wf, _ = jax.api_util.flatten_fun(wf, in_tree)
         logger.debug(in_tree)
-        wf, out_tree_thunk = jax.api_util.flatten_fun(wf, in_tree)
-        logger.debug(wf)
-        logger.debug('=' * 80)
+
         builder = MoxBuilder()
         wf = trace_modules(wf, builder)
-        logger.debug(wf)
-        logger.debug('=' * 80)
         with intercept_methods(builder.intercept):
-            out_args = wf.call_wrapped(*in_args)
-        logger.debug(out_args)
-        out_tree = out_tree_thunk()
-        logger.debug(out_tree)
-        res = jax.tree.unflatten(out_tree, out_args)
-        logger.debug('result: %s', res)
+            _ = wf.call_wrapped(*in_args)
+
+        # out_tree = out_tree_thunk()
+        # res = jax.tree.unflatten(out_tree, out_args)
         return builder.build()
     return wrapper
-
-
-def fully_qualified_name(ty: Type[nn.Module]) -> str:
-    if ty.__module__ == 'builtins':
-        return ty.__qualname__
-    else:
-        return f'{ty.__module__}.{ty.__qualname__}'
 
 
 class MoxBuilder:
 
     def __init__(self):
-        # TODO(@daskol): HuggingFace?
-        self.root = Root()
-        self.block_stack: list[Block] = [self.root]
+        self.root = Mox([], [], {})
+        self.block_stack: list[Mox] = [self.root]
+        self.symbols: dict[ModuleTracer, Symbol] = {}
 
-        self.module_stack: list[InterceptorContext] = []
+        self.module_stack: list[InterceptorContext] = []  # get_module_path
 
     def build(self) -> Mox:
         return self.root
@@ -214,7 +203,18 @@ class MoxBuilder:
         mpath = self.get_module_path()
         logger.debug('enter %s (%s)', type(context.module).__qualname__, mpath)
 
-        child = Block.from_interceptor_context(context)
+        in_syms = self.to_symbols(args)
+        out_syms = []  # TODO(@daskol): Should we run nested tracer?
+        # TODO(@daskol): How to flatten in abstract way?
+        # kwsyms = {t: s for t, s in zip(args, self.to_symbols(args))}
+
+        # It is important to access `__dict__` directly since `__getattr__` is
+        # overriden.
+        params = {f.name: context.module.__dict__.get(f.name)
+                  for f in fields(context.module) if f.name != 'parent'}
+        module_info = type(context.module), context.method_name
+        child = Mox(in_syms, out_syms, params, [], *module_info)
+
         parent = self.block_stack[-1]
         parent.children += [child]
         self.block_stack += [child]
@@ -227,7 +227,9 @@ class MoxBuilder:
         self.module_stack.pop()
         return result
 
-    def append(self, prim: jex.core.Primitive, tracers, *args, **kwargs):
+    def append(self, prim: jex.core.Primitive, params: dict[str, Any],
+               in_tracers: list[ModuleTracer],
+               out_tracers: list[ModuleTracer]):
         # Some models are not inhereted from `flax.linen.Module`. They define
         # an aggregate type on top of `flax.linen.Module` (e.g. HuggingFace
         # `trasnformers`). Thus, there are some ops which are outside of
@@ -236,34 +238,59 @@ class MoxBuilder:
             print(f'primitive {prim} does not have root module')
             return
 
-        if prim.name == 'pjit':
-            params, *_ = args
-            jaxpr = params['jaxpr']
-            instr = Instr(jaxpr)
-        else:
-            instr = Instr(prim)
+        in_symbols = self.to_symbols(in_tracers)
+        out_symbols = self.to_symbols(out_tracers)
+        eq = Equation(in_symbols, out_symbols, params, prim)
+
         block = self.block_stack[-1]
-        block.children.append(instr)
+        block.children.append(eq)
 
-    def to_string(self):
-        buf = StringIO()
-        print_node(self.root, fileobj=buf)
-        return buf.getvalue()
+    def set_inputs(self, tracers: Sequence[ModuleTracer]):
+        self.root.inputs.clear()
+        self.root.inputs.extend(self.to_symbols(tracers))
+
+    def set_outputs(self, tracers: Sequence[ModuleTracer] | ModuleTracer):
+        print(tracers)
+        if not isinstance(tracers, list | tuple | Sequence):
+            tracers = [tracers]
+        print(tracers)
+        self.root.outputs.clear()
+        self.root.outputs.extend(self.to_symbols(tracers))
+
+    def to_symbols(self, tracers: Sequence[ModuleTracer]) -> Sequence[Symbol]:
+        symbols = []
+        for tracer in tracers:
+            if (symbol := self.symbols.get(tracer)) is None:
+                symbol = Symbol(tracer.aval)
+                self.symbols[tracer] = symbol
+            symbols += [symbol]
+        return symbols
 
 
-def print_node(node: Node, depth=0, fileobj=None):
+def fully_qualified_name(ty: Type[nn.Module]) -> str:
+    if ty.__module__ == 'builtins':
+        return ty.__qualname__
+    else:
+        return f'{ty.__module__}.{ty.__qualname__}'
+
+
+def dump(node: Expr, fileobj: IO[str], *, depth=0):
     indent = '  ' * depth
     match node:
-        case Root():
-            print(f'{indent}mod {{ # {depth}', file=fileobj)
-        case Block():
-            name_ty = fully_qualified_name(node.module_ty)
-            name = node.attrs['name']
-            keys = (k for k in node.attrs.keys()
+        case Mox():
+            if node.is_ephemeral:
+                name_ty = 'Ephemeral'
+                name = '<none>'
+            else:
+                name_ty = fully_qualified_name(node.module_ty)
+                name = node.params['name']
+            print(f'{indent}inputs ={node.inputs}', file=fileobj)
+            print(f'{indent}outputs={node.outputs}', file=fileobj)
+            keys = (k for k in node.params.keys()
                     if k not in ('name', 'parent'))
             try:
                 key = next(keys)
-                val = node.attrs[key]
+                val = node.params[key]
                 attrs = f'{key}={val}'
             except StopIteration:
                 attrs = ''
@@ -271,10 +298,13 @@ def print_node(node: Node, depth=0, fileobj=None):
                   file=fileobj)
     for child in node.children:
         match child:
-            case Block():
-                print_node(child, depth + 1, fileobj=fileobj)
-            case Instr(name):
-                print(f'{indent}  {child.name}', file=fileobj)
+            case Mox():
+                dump(child, fileobj, depth=depth + 1)
+            case Equation():
+                print(f'{indent}  eq {child.prim.name}', file=fileobj)
+                print(f'{indent}  inputs ={child.inputs}', file=fileobj)
+                print(f'{indent}  outputs={child.outputs}', file=fileobj)
+                print(f'{indent}  {child}', file=fileobj)
     print(f'{indent}}}', file=fileobj)
 
 
@@ -282,7 +312,7 @@ class XPath:
     """XPath expression."""
 
 
-def mtree_map(fn: Callable[[Node], Any], tree: Mox):
+def mtree_map(fn: Callable[[Expr], Any], tree: Mox):
     """Apply map transformation `fn` to a module `tree`."""
 
 
