@@ -7,6 +7,7 @@ from functools import partial, wraps
 from io import StringIO
 from typing import IO, Any, ParamSpec, Sequence, Type
 
+import flax
 import flax.linen as nn
 import jax
 import jax.extend as jex
@@ -349,8 +350,38 @@ class XPath:
     """XPath expression."""
 
 
-def eval_module(read, write, mox: Mox, in_tree) -> None:
-    pass
+def eval_module(read, write, mox: Mox) -> None:
+    if mox.is_ephemeral:
+        raise NotImplementedError('Only concrete modules allowed.')
+
+    def read_safe(var: Symbol | flax.core.scope.Scope) -> Any:
+        if isinstance(var, Symbol):
+            return read(var)
+
+    # Weight and input symbol are all flattened and stored in single list. In
+    # order to apply module func to weights and inputs we need to separate
+    # them, restore weights, and restore inputs.
+    num_vars = mox.var_tree.num_leaves
+    var_syms = jax.tree.unflatten(mox.var_tree, mox.inputs[:num_vars])
+    var_vals = jax.tree.map(read, var_syms)
+
+    with flax.core.bind(var_vals).temporary() as scope:
+        mod = mox.module_ty(**mox.params)
+        scoped_mod = mod.clone(parent=scope)
+
+        # See func:`bind` in flax/core/scope.py:1105.
+        in_vals = jax.tree.map(read_safe, [scope] + mox.inputs[num_vars:])
+        (_, *in_args), in_kwargs = jax.tree.unflatten(mox.in_tree, in_vals)
+
+        unbound_fn = getattr(mox.module_ty, mox.entrypoint)
+        out_vals = unbound_fn(scoped_mod, *in_args, **in_kwargs)
+
+    # Output symbols are stored as flattened. So, we need to flatten outputs
+    # and write result back.
+    outputs, out_tree = jax.tree.flatten(out_vals)
+    assert out_tree == mox.out_tree, \
+        f'Output tree mismatched in eval time: {mox.out_tree} -> {out_tree}.'
+    jax.tree.map(write, mox.outputs, outputs)
 
 
 def eval_equation(read, write, eq: Equation) -> None:
@@ -365,13 +396,12 @@ def eval_equation(read, write, eq: Equation) -> None:
 
 def mtree_eval(tree: Mox, *args, **kwargs):
     """Evaluate a module expression `tree` with `args` and `kwargs`."""
-    Var = Any
     env: dict[Var, Any] = {}
 
-    def read(var: Var) -> Any:
+    def read(var: Symbol) -> Any:
         return env[var]
 
-    def write(var: Var, val: Any):
+    def write(var: Symbol, val: Any):
         assert var not in env, f'Variable {var} has been already defined.'
         env[var] = val
 
@@ -380,15 +410,15 @@ def mtree_eval(tree: Mox, *args, **kwargs):
             if node.is_ephemeral:
                 return node
             else:
-                return eval_module(read, write, node, in_tree)
+                return eval_module(read, write, node)
         elif isinstance(node, Equation):
             return eval_equation(read, write, node)
 
     # Initialize execution context and execute.
-    # TODO(@daskol): Use `in_tree`.
-    flatten_args, in_tree = jax.tree.flatten(args)
-    for symbol, value in zip(tree.inputs, flatten_args):
-        write(symbol, value)
+    flat_args, in_tree = jax.tree.flatten((args, {}))
+    assert in_tree == tree.in_tree, \
+        f'Arguments and input tree mismatched: {in_tree} vs {tree.in_tree}.'
+    jax.tree.map(write, tree.inputs, flat_args)
     mtree_map(fn, tree)
 
     flatten_res = [read(x) for x in tree.outputs]
