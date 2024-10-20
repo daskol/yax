@@ -2,9 +2,8 @@
 building and querying.
 """
 
-import logging
 from dataclasses import dataclass, field, fields
-from functools import wraps
+from functools import partial, wraps
 from io import StringIO
 from typing import IO, Any, ParamSpec, Sequence, Type
 
@@ -15,14 +14,18 @@ import jax.extend.linear_util as lu
 from flax.linen.module import Callable, InterceptorContext, intercept_methods
 from jax.core import MainTrace, ShapedArray, Sublevel, Trace, Tracer, new_main
 
+# TODO(@daskol): Make PR on reexporting PyTreeDef.
+try:
+    from jax.tree import PyTreeDef
+except ImportError:
+    from jax.tree_util import PyTreeDef
+
 __all__ = ('Equation', 'Expr', 'Literal', 'Mox', 'Var', 'Symbol', 'mox',
            'mtree_map', 'mtree_query', 'mtree_sub')
 
 # TODO(@daskol): Python 3.12 introduced new type parameter syntax (PEP-0695)
 # but some code quality tools (e.g. yapf) do not support this syntax.
 Args = ParamSpec('Args')
-
-logger = logging.getLogger(__name__)
 
 
 class ModuleTracer(Tracer):
@@ -137,11 +140,19 @@ class Equation(Expr):
     prim: jex.core.Primitive
 
 
+def default_treedef(default=()) -> PyTreeDef:
+    _, treedef = jax.tree.flatten(default)
+    return treedef
+
+
 @dataclass(repr=False, slots=True)
 class Mox(Expr):
     children: list[Expr] = field(default_factory=list)
     module_ty: Type[nn.Module] | None = None
     entrypoint: str | None = None
+    in_tree: PyTreeDef = field(default_factory=default_treedef)
+    out_tree: PyTreeDef = field(default_factory=default_treedef)
+    var_tree: PyTreeDef = field(default_factory=default_treedef)
 
     @property
     def is_ephemeral(self) -> bool:
@@ -169,16 +180,18 @@ def mox(fn: Callable[Args, Any]) -> Callable[Args, Mox]:
     def wrapper(*args: Args.args, **kwargs: Args.kwargs) -> Mox:
         wf = lu.wrap_init(fn)
         in_args, in_tree = jax.tree.flatten((args, kwargs))
-        wf, _ = jax.api_util.flatten_fun(wf, in_tree)
-        logger.debug(in_tree)
+        wf, out_tree_thunk = jax.api_util.flatten_fun(wf, in_tree)
 
+        # Root module expression is incomplete in traversing due to missing
+        # outputs. May be, it would be better to construct builder from both
+        # `inputs` and `in_tree at once.
         builder = MoxBuilder()
+        builder.set_input_tree(in_tree)
         wf = trace_modules(wf, builder)
         with intercept_methods(builder.intercept):
             _ = wf.call_wrapped(*in_args)
 
-        # out_tree = out_tree_thunk()
-        # res = jax.tree.unflatten(out_tree, out_args)
+        builder.set_output_tree(out_tree_thunk())
         return builder.build()
     return wrapper
 
@@ -202,35 +215,58 @@ class MoxBuilder:
     def intercept(self, fn: Callable[..., Any], args, kwargs,
                   context: InterceptorContext) -> Any:
         """A hook to intercept call of `flax.linen.Module` method."""
-        in_syms = self.to_symbols(args)
-        out_syms = []  # TODO(@daskol): Should we run nested tracer?
+        # TODO(@daskol): Should we run nested tracer?
         # TODO(@daskol): How to flatten in abstract way?
-        # kwsyms = {t: s for t, s in zip(args, self.to_symbols(args))}
-
         # It is important to access `__dict__` directly since `__getattr__` is
         # overriden.
         params = {f.name: context.module.__dict__.get(f.name)
                   for f in fields(context.module) if f.name != 'parent'}
         module_info = type(context.module), context.method_name
-        child = Mox(in_syms, out_syms, params, [], *module_info)
 
+        # Push on stack partially built module expression object. It will be
+        # finalized by the end of this routine.
+        child = Mox([], [], params, [], *module_info)
         parent = self.block_stack[-1]
         parent.children += [child]
         self.block_stack += [child]
 
-        # Forward call further and its result as is.
-        results = fn(*args, **kwargs)
+        # Flax passes a module function.
+        unbound_fn: Callable[..., Any]
+        if isinstance(fn, partial):
+            unbound_fn = fn.func
+        else:
+            method_fn = getattr(context.module, context.method_name)
+            unbound_fn = (lambda x: x.__func__)(method_fn)
+
+        # Flax assumes that the first argument is a weight dictionary (or
+        # Module or Scope). Thus, we need to flatten this dictionary for
+        # binding and unflatten it in evaluation time.
+        args = (context.module, ) + args
+        in_args, in_tree = jax.tree.flatten((args, kwargs))
+        flat_vars, var_tree = jax.tree.flatten(context.module.variables)
+        child.inputs.extend(self.to_symbols(flat_vars))
+        child.inputs.extend(self.to_symbols(in_args[1:]))  # XXX
+
+        # Flatten function (inputs and outputs) for building intermediate
+        # representation.
+        wrap_fn = lu.wrap_init(unbound_fn)
+        flat_fn, out_tree_fn = jax.api_util.flatten_fun(wrap_fn, in_tree)
+        outs = flat_fn.call_wrapped(*in_args)
+        out_tree = out_tree_fn()
 
         # TODO(@daskol): Should we introduce `flax_p` primitive here? Or just
         # flatten outputs?
-        multiple_results = not isinstance(results, Tracer)
+        multiple_results = not isinstance(outs, Tracer)
         if multiple_results:
-            child.outputs.extend(self.to_symbols(results))
+            child.outputs.extend(self.to_symbols(outs))
         else:
-            child.outputs.extend(self.to_symbols([results]))
+            child.outputs.extend(self.to_symbols([outs]))
 
+        child.in_tree = in_tree
+        child.out_tree = out_tree
+        child.var_tree = var_tree
         self.block_stack.pop()
-        return results
+        return jax.tree.unflatten(out_tree, outs)
 
     def append(self, prim: jex.core.Primitive, params: dict[str, Any],
                in_tracers: list[ModuleTracer],
@@ -242,9 +278,15 @@ class MoxBuilder:
         block = self.block_stack[-1]
         block.children.append(eq)
 
+    def set_input_tree(self, tree: PyTreeDef):
+        self.root.in_tree = tree
+
     def set_inputs(self, tracers: Sequence[ModuleTracer]):
         self.root.inputs.clear()
         self.root.inputs.extend(self.to_symbols(tracers))
+
+    def set_output_tree(self, tree: PyTreeDef):
+        self.root.out_tree = tree
 
     def set_outputs(self, tracers: Sequence[ModuleTracer] | ModuleTracer):
         if not isinstance(tracers, list | tuple | Sequence):

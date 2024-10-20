@@ -106,6 +106,25 @@ class TestBinaryModule:
         assert_allclose(actual, desired)
 
 
+class TestStatefulModule:
+
+    def test_make(self):
+        key = jax.random.PRNGKey(42)
+        batch = jnp.ones(4)
+        model = nn.Dense(4)
+        params = jax.jit(model.init)(key, batch)
+
+        mtree = mox(model.apply)(params, batch)
+        assert isinstance(mtree, Mox)
+        assert mtree.is_ephemeral
+        assert len(mtree.children) == 1
+
+        subtree: Mox = mtree.children[0]
+        assert not subtree.is_ephemeral
+        assert len(subtree.inputs) == 3
+        assert len(subtree.outputs) == 1
+
+
 class ResBlock(nn.Module):
 
     features: int = 4
@@ -130,7 +149,14 @@ class TestResBlock:
 
     def test_make(self, state: ModelState):
         mtree = mox(state.model.apply)(state.params, state.batch)
-        print(mtree)
+        assert isinstance(mtree, Mox)
+        assert mtree.is_ephemeral
+        assert len(mtree.children) == 1
+
+        subtree: Mox = mtree.children[0]
+        assert not subtree.is_ephemeral
+        assert len(subtree.inputs) == 3
+        assert len(subtree.outputs) == 1
 
     def test_eval(self, state: ModelState):
         mtree = mox(state.model.apply)(state.params, state.batch)
