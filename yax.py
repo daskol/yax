@@ -45,38 +45,79 @@ class ModuleTracer(Tracer):
 
     @property
     def aval(self):
-        # TODO(@daskol): Should be cached or precomputed.
+        # TODO(@daskol): Some abstract values should be less abstract. There is
+        # cases when we should preserve original concrete values. For example,
+        # arguments of binary operation between tracer and numerical literal
+        # like `x > 0`. In this case `x` should be evaluated as `ShapedArray`
+        # and zero as `ConcreteArray`. Otherwise, this constant values get
+        # missing in evaluation time.
         return jax.api_util.shaped_abstractify(self.value)
 
     def full_lower(self):
-        # TODO(@daskol): Full lower to some abstract array type.
-        # return jax.core.full_lower(self.value)
-        assert isinstance(self, Tracer)
-        return self
+        # TODO(@daskol): How to properly implement lowering?
+        #
+        # The idea is that we need only tracers for abstract avaluation. Thus,
+        # we should not lower tracer to anything other than a Tracer (actually,
+        # a ModuleTracer). It seems that we should `full_lower` everywhere
+        # instead of `full_raise`.
+        match self.value:
+            case ModuleTracer():
+                return self.value.full_lower()
+            case Tracer():
+                raise RuntimeError(
+                    'Unreachable executation path: full lowering expects '
+                    'value to be either ModuleTracer or an Array '
+                    f'implementation but actual type is {type(self.value)}.')
+            case _:
+                return self
 
 
-class ModuleTrace(Trace):
+class ModuleTrace(Trace[ModuleTracer]):
 
     def __init__(self, main: MainTrace, sublevel: Sublevel, **kwargs) -> None:
         super().__init__(main, sublevel)
         self.builder: MoxBuilder = kwargs.get('builder')
 
-    def pure(self, val):
+    def pure(self, val) -> ModuleTracer:
         return ModuleTracer(self, val)
 
-    def lift(self, val):
+    def lift(self, val) -> ModuleTracer:
+        return ModuleTracer(self, val)
+
+    def sublift(self, val) -> ModuleTracer:
         return ModuleTracer(self, val)
 
     def process_primitive(self, prim: jex.core.Primitive, tracers, params):
         result, _ = prim.abstract_eval(*[x.aval for x in tracers], **params)
-        # TODO(@daskol): Add tracers too?
-        if prim.multiple_results:
-            out_tracers = [ModuleTracer(self, out) for out in result]
-            self.builder.append(prim, params, tracers, out_tracers)
-        else:
-            out_tracers = ModuleTracer(self, result)
-            self.builder.append(prim, params, tracers, [out_tracers])
+
+        outs, out_tree = jax.tree.flatten(result)
+        assert all(isinstance(x, ShapedArray) for x in outs if x), \
+            'Assumption on type of result is violated: {outs}.'
+
+        out_flat_tracers = [ModuleTracer(self, x) for x in outs]
+        out_tracers = jax.tree.unflatten(out_tree, out_flat_tracers)
+        self.builder.append(prim, params, tracers, out_flat_tracers)
         return out_tracers
+
+    def process_custom_jvp_call(self, primitive, fun, jvp, tracers, **kwargs):
+        del primitive, jvp, kwargs
+        # TODO(@daskol): Why reference implementations in JAX create a
+        # subtracer? Is it just purely debugging think? It seems that sublevels
+        # helps to find leaking tracers. This can be highly important for
+        # partial evauation but here we just forward tracers to our
+        # `process_primitive` method.
+        #
+        # We would enforce subtracers here. Then one should uncomment the
+        # following. The only issue is that its unclear how to process
+        # `out_tracers`. Should we `full_lower` them and wrap up them again
+        # with outer tracer?
+        #
+        #   with jax.core.new_sublevel():
+        #       trace: ModuleTrace = self.main.with_cur_sublevel()
+        #       in_tracers = [trace.sublift(t) for t in tracers]
+        #       out_tracers = fun.call_wrapped(*in_tracers)
+        #       return [trace.full_raise(t) for t in out_tracers]
+        return fun.call_wrapped(*tracers)
 
 
 @lu.transformation
@@ -86,7 +127,11 @@ def _lower(builder: 'MoxBuilder', main: MainTrace, *ins):
     builder.set_inputs(in_tracers)
     out_tracers = yield in_tracers, {}
     builder.set_outputs(out_tracers)
-    outs = [trace.full_raise(x).value for x in out_tracers]
+
+    # TODO(@daskol): We do not use output tracers. Should we remove them? This
+    # issue is related to the proper implementation of (sub)lifting and
+    # unboxing that still have quite vague semantics.
+    outs = [trace.full_raise(t) for t in out_tracers]
     yield outs
 
 
@@ -433,7 +478,7 @@ def mtree_map(fn: Callable[[Expr], Any], tree: Mox):
     while nodes:
         node: Expr = nodes.pop()
         if isinstance(res := fn(node), Mox):
-            nodes += res.children
+            nodes += reversed(res.children)
 
 
 def mtree_sub(expr: str | XPath, tree: Mox, subtree: Mox) -> Mox:
