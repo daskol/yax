@@ -1,3 +1,43 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yax"
+description = "Yet Another X library: JAX/FLAX module tracing."
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Daniel Bershatsky", email = "daniel.bershatsky@gmail.com"},
+]
+readme = {file = "README.md", content-type = "text/markdown"}
+version = "0.0.0"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Other Environment",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Natural Language :: English",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Typing :: Typed",
+]
+dependencies = ["flax", "jax", "numpy"]
+requires-python = ">=3.12,<4"
+
+[project.optional-dependencies]
+dev = ["isort", "pytest>=8.2", "ruff"]
+test = ["transformers"]
+
+[project.urls]
+Homepage = "https://github.com/daskol/yax"
+Repository = "https://github.com/daskol/yax.git"
+
 [tool.isort]
 combine_as_imports = true
 known_first_party = ["yax"]
@@ -40,6 +80,10 @@ inline-quotes = "single"
 [tool.ruff.lint.pycodestyle]
 max-doc-length = 79
 max-line-length = 79
+
+[tool.setuptools]
+zip-safe = true
+py-modules = ["yax"]
 
 [tool.yapf]
 based_on_style = "pep8"

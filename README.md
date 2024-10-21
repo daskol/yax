@@ -1,3 +1,9 @@
+![Linting and testing][1]
+![Nightly][2]
+
+[1]: https://github.com/daskol/yax/actions/workflows/on-push.yml/badge.svg
+[2]: https://github.com/daskol/yax/actions/workflows/on-schedule.yml/badge.svg
+
 # YAX
 
 *Yet Another X*
