@@ -175,7 +175,6 @@ class TestResBlock:
         assert_allclose(actual, desired)
 
 
-@pytest.mark.xfail(reason='no dynamic trace')
 @pytest.mark.slow
 class TestHFModels:
 
@@ -189,5 +188,11 @@ class TestHFModels:
             .from_pretrained('roberta-base')
 
         input_ids = jnp.ones((1, 3), dtype=jnp.int32)
-        mtree = mox(model)(input_ids)
-        print(mtree)
+        mtree = mox(model)(input_ids=input_ids, params=model.params)
+
+        # TODO(@daskol): Reference evaluation returns a dataclass object while
+        # we do not preserve it. Is it okay?
+        actual = mtree_eval(mtree, input_ids=input_ids, params=model.params)
+        desired, *_ = model(input_ids=input_ids, params=model.params,
+                            return_dict=False)
+        assert_allclose(actual, desired)

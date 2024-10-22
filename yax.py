@@ -5,15 +5,18 @@ building and querying.
 from dataclasses import dataclass, field, fields
 from functools import partial, wraps
 from io import StringIO
-from typing import IO, Any, ParamSpec, Sequence, Type
+from typing import IO, Any, Generic, ParamSpec, Sequence, Type, TypeVar
 
 import flax
 import flax.linen as nn
 import jax
 import jax.extend as jex
 import jax.extend.linear_util as lu
+import jax.numpy as jnp
 from flax.linen.module import Callable, InterceptorContext, intercept_methods
-from jax.core import MainTrace, ShapedArray, Sublevel, Trace, Tracer, new_main
+from jax.core import (
+    AbstractValue, ConcreteArray, MainTrace, ShapedArray, Sublevel, Trace,
+    Tracer, find_top_trace, new_main)
 
 # TODO(@daskol): Make PR on reexporting PyTreeDef.
 try:
@@ -44,14 +47,17 @@ class ModuleTracer(Tracer):
         return self is other
 
     @property
-    def aval(self):
+    def aval(self) -> AbstractValue:
         # TODO(@daskol): Some abstract values should be less abstract. There is
         # cases when we should preserve original concrete values. For example,
         # arguments of binary operation between tracer and numerical literal
         # like `x > 0`. In this case `x` should be evaluated as `ShapedArray`
         # and zero as `ConcreteArray`. Otherwise, this constant values get
         # missing in evaluation time.
-        return jax.api_util.shaped_abstractify(self.value)
+        if isinstance(self.value, AbstractValue):
+            return self.value
+        else:
+            return jax.api_util.shaped_abstractify(self.value)
 
     def full_lower(self):
         # TODO(@daskol): How to properly implement lowering?
@@ -79,13 +85,24 @@ class ModuleTrace(Trace[ModuleTracer]):
         self.builder: MoxBuilder = kwargs.get('builder')
 
     def pure(self, val) -> ModuleTracer:
-        return ModuleTracer(self, val)
+        """Wrap value to monadic/functorial context.
 
-    def lift(self, val) -> ModuleTracer:
-        return ModuleTracer(self, val)
+        Our `pure` differ from original implementation in a way to work not
+        only with Arrays but with AbstractValues. The idea is to interpret
+        concrete arrays as literals while shaped arrays are just variables.
+        Thus, we abstractify input arrays (arguments) manually.
+        """
+        if isinstance(val, AbstractValue):
+            aval = val
+        else:
+            aval = jax.core.get_aval(val)
+        return ModuleTracer(self, aval)
 
-    def sublift(self, val) -> ModuleTracer:
-        return ModuleTracer(self, val)
+    def lift(self, tracer: Tracer) -> ModuleTracer:
+        return ModuleTracer(self, tracer)
+
+    def sublift(self, tracer: Tracer) -> ModuleTracer:
+        return ModuleTracer(self, tracer)
 
     def process_primitive(self, prim: jex.core.Primitive, tracers, params):
         result, _ = prim.abstract_eval(*[x.aval for x in tracers], **params)
@@ -123,16 +140,18 @@ class ModuleTrace(Trace[ModuleTracer]):
 @lu.transformation
 def _lower(builder: 'MoxBuilder', main: MainTrace, *ins):
     trace: ModuleTrace = main.with_cur_sublevel()
-    in_tracers = [trace.lift(x) for x in ins]
+
+    # NOTE We manually abstractify up to ShapedArray all input arguments.
+    in_tracers = [trace.pure(jax.api_util.shaped_abstractify(x)) for x in ins]
     builder.set_inputs(in_tracers)
-    out_tracers = yield in_tracers, {}
-    builder.set_outputs(out_tracers)
+    outs = yield in_tracers, {}
 
     # TODO(@daskol): We do not use output tracers. Should we remove them? This
     # issue is related to the proper implementation of (sub)lifting and
     # unboxing that still have quite vague semantics.
-    outs = [trace.full_raise(t) for t in out_tracers]
-    yield outs
+    out_tracers = [trace.full_raise(t) for t in outs]
+    builder.set_outputs(out_tracers)
+    yield out_tracers
 
 
 @lu.transformation
@@ -147,9 +166,17 @@ def trace_modules(wf: lu.WrappedFun, builder: 'MoxBuilder') -> lu.WrappedFun:
     return _raise(_lower(wf, builder), builder)
 
 
+SymbolValueType = TypeVar('SymbolValueType', bound='ShapedArray')
+
+
 @dataclass(slots=True)
-class Symbol:
-    aval: ShapedArray
+class Symbol(Generic[SymbolValueType]):
+    """A value placeholder in evaluation time.
+
+    Derived dataclasses should not generate `__eq__` to preserve `__hash__`.
+    """
+
+    value: SymbolValueType
 
     def __eq__(self, other) -> bool:
         return self is other
@@ -158,26 +185,30 @@ class Symbol:
         return id(self)
 
 
-@dataclass(slots=True)
-class Var(Symbol):
+@dataclass(slots=True, eq=False)
+class Var(Symbol[ShapedArray]):
     pass
 
 
-@dataclass(init=False, slots=True)
-class Literal(Symbol):
-    value: Any
+@dataclass(slots=True, eq=False)
+class Literal(Symbol[ConcreteArray]):
+    @property
+    def const(self):
+        return self.value.val
 
-    def __init__(self, value: Any, aval: ShapedArray | None = None):
-        if aval is None:
-            aval = ...  # TODO(@daskol): Get shaped.
-        super().__init__(aval)
-        self.value = value
+
+# Check hashability of Symbol hierarchy.
+_ = {
+    Symbol(ShapedArray((), jnp.float32)),
+    Var(ShapedArray((), jnp.float32)),
+    Literal(ConcreteArray(jnp.float32, jnp.empty(()))),
+}
 
 
 @dataclass(slots=True)
 class Expr:
     inputs: list[Symbol]
-    outputs: list[Var]
+    outputs: list[Symbol]
     params: dict[str, Any]
 
 
@@ -284,35 +315,35 @@ class MoxBuilder:
             method_fn = getattr(context.module, context.method_name)
             unbound_fn = (lambda x: x.__func__)(method_fn)
 
+        # Assume that weights are already wrapped up.
+        flat_vars, child.var_tree = jax.tree.flatten(context.module.variables)
+        child.inputs.extend(self.to_symbols(flat_vars))
+
         # Flax assumes that the first argument is a weight dictionary (or
         # Module or Scope). Thus, we need to flatten this dictionary for
         # binding and unflatten it in evaluation time.
         args = (context.module, ) + args
-        in_args, in_tree = jax.tree.flatten((args, kwargs))
-        flat_vars, var_tree = jax.tree.flatten(context.module.variables)
-        child.inputs.extend(self.to_symbols(flat_vars))
-        child.inputs.extend(self.to_symbols(in_args[1:]))  # XXX
+        (scope, *in_args), child.in_tree = jax.tree.flatten((args, kwargs))
+        trace = find_top_trace(flat_vars + in_args)  # TODO(@daskol): Dynamic!
+        in_tracers = [trace.full_raise(a) for a in in_args]
+        child.inputs.extend(self.to_symbols(in_tracers))  # XXX
 
         # Flatten function (inputs and outputs) for building intermediate
         # representation.
         wrap_fn = lu.wrap_init(unbound_fn)
-        flat_fn, out_tree_fn = jax.api_util.flatten_fun(wrap_fn, in_tree)
-        outs = flat_fn.call_wrapped(*in_args)
-        out_tree = out_tree_fn()
+        flat_fn, out_tree_fn = jax.api_util.flatten_fun(wrap_fn, child.in_tree)
+        outs = flat_fn.call_wrapped(scope, *in_tracers)
 
-        # TODO(@daskol): Should we introduce `flax_p` primitive here? Or just
-        # flatten outputs?
-        multiple_results = not isinstance(outs, Tracer)
-        if multiple_results:
-            child.outputs.extend(self.to_symbols(outs))
-        else:
-            child.outputs.extend(self.to_symbols([outs]))
+        # TODO(@daskol): Remove code duplication with `_lower`.
+        flat_outs, _ = jax.tree.flatten(outs)
+        out_tracers = [trace.full_raise(x) for x in flat_outs]
 
-        child.in_tree = in_tree
-        child.out_tree = out_tree
-        child.var_tree = var_tree
+        # TODO(@daskol): Should we introduce `module_call` primitive here? Or
+        # just flatten outputs?
+        child.out_tree = out_tree_fn()
+        child.outputs.extend(self.to_symbols(out_tracers))
         self.block_stack.pop()
-        return jax.tree.unflatten(out_tree, outs)
+        return jax.tree.unflatten(child.out_tree, outs)
 
     def append(self, prim: jex.core.Primitive, params: dict[str, Any],
                in_tracers: list[ModuleTracer],
@@ -344,7 +375,14 @@ class MoxBuilder:
         symbols = []
         for tracer in tracers:
             if (symbol := self.symbols.get(tracer)) is None:
-                symbol = Symbol(tracer.aval)
+                match tracer.aval:
+                    case ConcreteArray():
+                        symbol = Literal(tracer.aval)
+                    case ShapedArray():
+                        symbol = Var(tracer.aval)
+                    case _:
+                        raise RuntimeError('Unexpected abstract value of type '
+                                           f'{type(tracer.aval)}.')
                 self.symbols[tracer] = symbol
             symbols += [symbol]
         return symbols
@@ -444,7 +482,12 @@ def mtree_eval(tree: Mox, *args, **kwargs):
     env: dict[Var, Any] = {}
 
     def read(var: Symbol) -> Any:
-        return env[var]
+        """Read a symbol from execution context or take literal value."""
+        if (val := env.get(var)) is not None:
+            return val
+        if isinstance(var, Literal):
+            return var.const
+        raise KeyError(f'Variable {var} is undefined.')
 
     def write(var: Symbol, val: Any):
         assert var not in env, f'Variable {var} has been already defined.'
@@ -460,7 +503,7 @@ def mtree_eval(tree: Mox, *args, **kwargs):
             return eval_equation(read, write, node)
 
     # Initialize execution context and execute.
-    flat_args, in_tree = jax.tree.flatten((args, {}))
+    flat_args, in_tree = jax.tree.flatten((args, kwargs))
     assert in_tree == tree.in_tree, \
         f'Arguments and input tree mismatched: {in_tree} vs {tree.in_tree}.'
     jax.tree.map(write, tree.inputs, flat_args)
