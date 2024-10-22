@@ -90,4 +90,4 @@ jobs:
       # This step never fails but it is useful to monitor status of type
       # corectness.
       - name: Check typing
-        run: mypy yax
+        run: mypy -m yax || true
