@@ -20,7 +20,7 @@ from jax.core import (
 
 # TODO(@daskol): Make PR on reexporting PyTreeDef.
 try:
-    from jax.tree import PyTreeDef
+    from jax.tree import PyTreeDef  # type: ignore[attr-defined]
 except ImportError:
     from jax.tree_util import PyTreeDef
 
@@ -80,9 +80,10 @@ class ModuleTracer(Tracer):
 
 class ModuleTrace(Trace[ModuleTracer]):
 
-    def __init__(self, main: MainTrace, sublevel: Sublevel, **kwargs) -> None:
+    def __init__(self, main: MainTrace, sublevel: Sublevel, *,
+                 builder: 'MoxBuilder', **kwargs) -> None:
         super().__init__(main, sublevel)
-        self.builder: MoxBuilder = kwargs.get('builder')
+        self.builder: MoxBuilder = builder
 
     def pure(self, val) -> ModuleTracer:
         """Wrap value to monadic/functorial context.
@@ -388,8 +389,10 @@ class MoxBuilder:
         return symbols
 
 
-def fully_qualified_name(ty: Type[nn.Module]) -> str:
-    if ty.__module__ == 'builtins':
+def fully_qualified_name(ty: Type[nn.Module] | None) -> str:
+    if ty is None:
+        return '<none>'
+    elif ty.__module__ == 'builtins':
         return ty.__qualname__
     else:
         return f'{ty.__module__}.{ty.__qualname__}'
@@ -417,6 +420,8 @@ def dump(node: Expr, fileobj: IO[str], *, depth=0):
                 attrs = ''
             print(f'{indent}mod {name} : {name_ty}({attrs}) {{ # {depth}',
                   file=fileobj)
+        case Expr():
+            raise RuntimeError('Unexpected node of type {type(node)}.')
     for child in node.children:
         match child:
             case Mox():
@@ -433,7 +438,7 @@ class XPath:
     """XPath expression."""
 
 
-def eval_module(read, write, mox: Mox) -> None:
+def eval_module(read, write, mox: Mox):
     if mox.is_ephemeral:
         raise NotImplementedError('Only concrete modules allowed.')
 
@@ -467,7 +472,7 @@ def eval_module(read, write, mox: Mox) -> None:
     jax.tree.map(write, mox.outputs, outputs)
 
 
-def eval_equation(read, write, eq: Equation) -> None:
+def eval_equation(read, write, eq: Equation):
     in_vals = [read(x) for x in eq.inputs]  # TODO(@daskol): Trees?
     subfuns, params = eq.prim.get_bind_params(eq.params)
     out_vals = eq.prim.bind(*subfuns, *in_vals, **params)
@@ -479,7 +484,7 @@ def eval_equation(read, write, eq: Equation) -> None:
 
 def mtree_eval(tree: Mox, *args, **kwargs):
     """Evaluate a module expression `tree` with `args` and `kwargs`."""
-    env: dict[Var, Any] = {}
+    env: dict[Symbol, Any] = {}
 
     def read(var: Symbol) -> Any:
         """Read a symbol from execution context or take literal value."""
@@ -517,7 +522,7 @@ def mtree_eval(tree: Mox, *args, **kwargs):
 
 def mtree_map(fn: Callable[[Expr], Any], tree: Mox):
     """Apply map transformation `fn` to a module `tree`."""
-    nodes = [tree]
+    nodes: list[Expr] = [tree]
     while nodes:
         node: Expr = nodes.pop()
         if isinstance(res := fn(node), Mox):
