@@ -24,7 +24,7 @@ from jax import Array
 from jax.extend.core import ClosedJaxpr, primitives
 from numpy.testing import assert_allclose
 
-from yax import Equation, Mox, mox, mtree_eval
+from yax import Equation, Mox, mox, mox as make_mox, mtree_eval
 
 
 @pytest.mark.parametrize('fn', [
@@ -187,6 +187,15 @@ class TestResBlock:
         actual = mtree_eval(mtree, state.params, state.batch)
         desired = state.model.apply(state.params, state.batch)
         assert_allclose(actual, desired)
+
+    def test_to_dict(self, state: ModelState):
+        mox = make_mox(state.model.apply)(state.params, state.batch)
+        tree = mox.to_dict()
+        assert isinstance(tree, dict)
+        assert tree['ephemeral']
+        assert len(tree['children']) == 1
+        subtree: dict[str, Any] = tree['children'][0]
+        assert not subtree['ephemeral']
 
 
 @pytest.mark.slow

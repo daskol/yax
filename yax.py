@@ -20,6 +20,7 @@ import re
 from dataclasses import dataclass, field, fields
 from functools import partial, wraps
 from io import StringIO
+from json import dumps
 from typing import (
     IO, Any, ClassVar, Generic, ParamSpec, Self, Sequence, Type, TypeVar)
 
@@ -31,8 +32,8 @@ import jax.extend.linear_util as lu
 import jax.numpy as jnp
 from flax.linen.module import Callable, InterceptorContext, intercept_methods
 from jax.core import (
-    AbstractValue, ConcreteArray, MainTrace, ShapedArray, Sublevel, Trace,
-    Tracer, find_top_trace, new_main)
+    AbstractValue, ClosedJaxpr as Jaxpr, ConcreteArray, MainTrace, ShapedArray,
+    Sublevel, Trace, Tracer, find_top_trace, new_main)
 
 # TODO(@daskol): Make PR on reexporting PyTreeDef.
 try:
@@ -239,7 +240,7 @@ def default_treedef(default=()) -> PyTreeDef:
     return treedef
 
 
-@dataclass(repr=False, slots=True)
+@dataclass(slots=True)
 class Mox(Expr):
     children: list[Expr] = field(default_factory=list)
     module_ty: Type[nn.Module] | None = None
@@ -259,6 +260,32 @@ class Mox(Expr):
         buf = StringIO()
         dump(self, buf)
         return buf.getvalue()
+
+    def to_dict(self) -> dict[str, Any]:
+        children = []
+        for child in self.children:
+            if isinstance(child, Mox):
+                children.append(child.to_dict())
+            elif isinstance(child, Equation):
+                children.append({**child.params, 'primitive': child.prim.name})
+        res = {
+            **self.params,
+            'primitive': 'module_call',
+            'entrypoint': self.entrypoint,
+            'ephemeral': self.is_ephemeral,
+            'children': children,
+        }
+        if self.module_ty:
+            res['type'] = self.module_ty.__name__
+        return res
+
+    def to_json(self, indent: int | None = None) -> str:
+        def default(obj):
+            if isinstance(obj, Jaxpr):
+                return obj.pretty_print(use_color=False)
+            return getattr(obj, '__name__', str(obj))
+        return dumps(self.to_dict(), ensure_ascii=False, indent=indent,
+                     default=default)
 
 
 def mox(fn: Callable[Args, Any]) -> Callable[Args, Mox]:
