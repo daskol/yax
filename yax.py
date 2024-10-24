@@ -501,7 +501,7 @@ class Token:
     _NODE_TYPE: ClassVar = re.compile(
         r'(comment|text|processing-instruction|node)')
 
-    _NAME_CHAR: ClassVar = re.compile(r'[0-9A-z_]+')
+    _NAME_CHAR: ClassVar = re.compile(r'[A-z_][0-9A-z_]*')
 
     _DOUBLE_QUOTED_STR: ClassVar = re.compile(r'"[^"]*"')
     _SINGLE_QUOTED_STR: ClassVar = re.compile(r"'[^']*'")
@@ -527,10 +527,10 @@ def tokenize_xpath(val: str):
 
 
 def tokenize_expr_token(val: str, last: Token):
-    if val[:1] in '()[]@,':
-        return val[1:], Token(val[:1])
-    elif val[:2] in ('..', '::'):
+    if val[:2] in ('..', '::'):
         return val[2:], Token(val[:2])
+    elif val[:1] in '()[]@,.':
+        return val[1:], Token(val[:1])
 
     _PARSERS = (tokenize_name_test, tokenize_node_type, tokenize_node_operator,
                 tokenize_function_name, tokenize_axis_name, tokenize_literal,
@@ -628,12 +628,121 @@ class XPath:
 
     def __init__(self, xpath: str | Self):
         if isinstance(xpath, XPath):
-            self.tokens = (*xpath.tokens, )
+            self.locs = (*xpath.locs, )
             return
         try:
-            self.tokens = (*tokenize_xpath(xpath), )
+            tokens = (*tokenize_xpath(xpath), )
         except Exception as e:
             raise RuntimeError(f'Failed to tokenize XPath: {xpath}.') from e
+
+        try:
+            self.locs = (*parse_xpath(tokens), )
+        except Exception as e:
+            raise RuntimeError(f'Failed to parse XPath: {xpath}.') from e
+
+    def __repr__(self) -> str:
+        return ' '.join(repr(x) for x in self.locs)
+
+    def __str__(self) -> str:
+        return '/'.join(str(x) for x in self.locs)
+
+
+@dataclass(slots=True, frozen=True)
+class LocationPredicate:
+    func: Callable[[dict[str, Any]], bool]
+    desc: str
+
+    def __call__(self, attrs: dict[str, Any]) -> bool:
+        return self.func(attrs)
+
+    def __str__(self) -> str:
+        return self.desc
+
+
+@dataclass(slots=True, frozen=True)
+class LocationStep:
+    axis: str
+    node: str
+    predicate: tuple[LocationPredicate, ...] = ()
+
+    def __str__(self) -> str:
+        pred = ''.join(str(p) for p in self.predicate)
+        return f'{self.axis}::{self.node}{pred}'
+
+
+def parse_xpath(tokens: list[Token]):
+    if len(tokens) == 0:
+        yield LocationStep('self', 'node()')
+    if len(tokens) == 1:
+        if tokens[0].kind == 'Operator' and tokens[0].value == '/':
+            yield LocationStep('self', 'node()')
+            return
+    while tokens:
+        if tokens[0].kind == 'Operator':
+            if tokens[0].value == '/':
+                tokens = tokens[1:]
+            elif tokens[0].value == '//':
+                yield LocationStep('descendant-or-self', 'node()')
+                tokens = tokens[1:]
+            else:
+                raise RuntimeError(f'Unexpected operator: {tokens[0]!r}.')
+        else:
+            loc, tokens = parse_location_step(tokens)
+            yield loc
+
+
+def parse_location_step(tokens: list[Token]):
+    # Abbreviated step first.
+    if tokens[0].kind == '.':
+        return LocationStep('self', 'node()'), tokens[1:]
+    elif tokens[0].kind == '..':
+        return LocationStep('parent', 'node()'), tokens[1:]
+
+    if tokens[0].kind == '@':
+        axis = 'attribute'
+        tokens = tokens[1:]
+    elif all([len(tokens) > 1,
+              tokens[0].kind == 'AxisName', tokens[1].kind == '::']):
+        axis = tokens[1].value
+        tokens = tokens[2:]
+    else:
+        axis = 'self'  # Default axis specifier.
+
+    if len(tokens) > 0 and tokens[0].kind == 'NameTest':
+        node = tokens[0].value
+        tokens = tokens[1:]
+    elif all([len(tokens) > 2 and tokens[0].kind == 'NodeType',
+              tokens[1].kind == '(', tokens[2].kind == ')']):
+        node = f'{tokens[0].value}()'
+        tokens = tokens[3:]
+    else:
+        node = 'node()'
+
+    preds = ()
+    while len(tokens) > 5:
+        if tokens[0].kind != '[':
+            break
+        prefix = ''.join(t.kind for t in tokens[:4])
+        if prefix != '[@NameTestOperator':
+            raise RuntimeError('Failed to parse predicate of a step.')
+        if tokens[4].kind not in ('Literal', 'Number'):
+            raise RuntimeError('Failed to parse predicate of a step.')
+        if tokens[5].kind != ']':
+            raise RuntimeError('Failed to parse predicate of a step.')
+        key = tokens[2].value
+        try:
+            val = int(tokens[4].value)
+        except ValueError:
+            try:
+                val = float(tokens[4].value)
+            except ValueError:
+                val = tokens[4].value
+        pred = LocationPredicate(lambda x: x[key] == val,
+                                 ''.join(str(t) for t in tokens[:6]))
+        preds += (pred, )
+        tokens = tokens[6:]
+
+    return LocationStep(axis, node, preds), tokens
 
 
 def eval_module(read, write, mox: Mox):
