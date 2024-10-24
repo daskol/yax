@@ -22,7 +22,8 @@ from functools import partial, wraps
 from io import StringIO
 from json import dumps
 from typing import (
-    IO, Any, ClassVar, Generic, ParamSpec, Self, Sequence, Type, TypeVar)
+    IO, Any, ClassVar, Generic, ParamSpec, Self, Sequence, Type, TypeAlias,
+    TypeVar)
 
 import flax
 import flax.linen as nn
@@ -234,6 +235,9 @@ class Expr:
 class Equation(Expr):
     prim: jex.core.Primitive
 
+    def to_dict(self, recursively=True) -> dict[str, Any]:
+        return {**self.params, 'primitive': self.prim.name}
+
 
 def default_treedef(default=()) -> PyTreeDef:
     _, treedef = jax.tree.flatten(default)
@@ -261,22 +265,26 @@ class Mox(Expr):
         dump(self, buf)
         return buf.getvalue()
 
-    def to_dict(self) -> dict[str, Any]:
-        children = []
-        for child in self.children:
-            if isinstance(child, Mox):
-                children.append(child.to_dict())
-            elif isinstance(child, Equation):
-                children.append({**child.params, 'primitive': child.prim.name})
+    def to_dict(self, recursively=True) -> dict[str, Any]:
         res = {
             **self.params,
             'primitive': 'module_call',
             'entrypoint': self.entrypoint,
             'ephemeral': self.is_ephemeral,
-            'children': children,
         }
         if self.module_ty:
             res['type'] = self.module_ty.__name__
+        if recursively:
+            children = []
+            for child in self.children:
+                if isinstance(child, Mox):
+                    children.append(child.to_dict())
+                elif isinstance(child, Equation):
+                    children.append({
+                        **child.params, 'primitive':
+                        child.prim.name
+                    })
+            res['children'] = children
         return res
 
     def to_json(self, indent: int | None = None) -> str:
@@ -636,7 +644,7 @@ class XPath:
             raise RuntimeError(f'Failed to tokenize XPath: {xpath}.') from e
 
         try:
-            self.locs = (*parse_xpath(tokens), )
+            self.locs: tuple[LocationStep, ...] = (*parse_xpath(tokens), )
         except Exception as e:
             raise RuntimeError(f'Failed to parse XPath: {xpath}.') from e
 
@@ -647,9 +655,12 @@ class XPath:
         return '/'.join(str(x) for x in self.locs)
 
 
+PredicateFn: TypeAlias = Callable[[dict[str, Any]], bool]
+
+
 @dataclass(slots=True, frozen=True)
 class LocationPredicate:
-    func: Callable[[dict[str, Any]], bool]
+    func: PredicateFn
     desc: str
 
     def __call__(self, attrs: dict[str, Any]) -> bool:
@@ -701,18 +712,18 @@ def parse_location_step(tokens: list[Token]):
     if tokens[0].kind == '@':
         axis = 'attribute'
         tokens = tokens[1:]
-    elif all([len(tokens) > 1,
-              tokens[0].kind == 'AxisName', tokens[1].kind == '::']):
+    elif (len(tokens) > 1 and
+          tokens[0].kind == 'AxisName' and tokens[1].kind == '::'):
         axis = tokens[1].value
         tokens = tokens[2:]
     else:
-        axis = 'self'  # Default axis specifier.
+        axis = 'child'  # Default axis specifier.
 
     if len(tokens) > 0 and tokens[0].kind == 'NameTest':
         node = tokens[0].value
         tokens = tokens[1:]
-    elif all([len(tokens) > 2 and tokens[0].kind == 'NodeType',
-              tokens[1].kind == '(', tokens[2].kind == ')']):
+    elif (len(tokens) > 2 and tokens[0].kind == 'NodeType' and
+          tokens[1].kind == '(' and tokens[2].kind == ')'):
         node = f'{tokens[0].value}()'
         tokens = tokens[3:]
     else:
@@ -736,7 +747,7 @@ def parse_location_step(tokens: list[Token]):
             try:
                 val = float(tokens[4].value)
             except ValueError:
-                val = tokens[4].value
+                val = tokens[4].value[1:-1]
         pred = LocationPredicate(lambda x: x[key] == val,
                                  ''.join(str(t) for t in tokens[:6]))
         preds += (pred, )
@@ -842,7 +853,7 @@ def mtree_sub(expr: str | XPath, tree: Mox, subtree: Mox) -> Mox:
     """
 
 
-def mtree_query(expr: str | XPath, tree: Mox) -> Sequence[Any]:
+def mtree_query(expr: str | XPath, mox: Mox) -> Sequence[Any]:
     """Get modules or their properties by XPath expression.
 
     >>> class ResBlock(nn.Module):
@@ -855,3 +866,77 @@ def mtree_query(expr: str | XPath, tree: Mox) -> Sequence[Any]:
     >>> mtree_query('//[@features=10]')
     [nn.Dense(10)]
     """
+    xpath = XPath(expr)
+    nodes = (mox, )
+    for i, step in enumerate(xpath.locs):
+        # TODO(@daskol): Support full range of name locations. Proper
+        # implementation requires element nodes with reference to parent
+        # element. We could do it with the power of built-in `xml`.
+        if step.axis == 'self' and step.node == 'node()':
+            pass  # Node set is not changed.
+        elif step.axis == 'descendant-or-self' and step.node == 'node()':
+            nodes = select_all_descendants(nodes)
+        elif step.axis == 'child':
+            # TODO(@daskol): Some node type expression ignored (e.g. text).
+            if step.node == 'node()':
+                nodes = select_children(nodes)
+            elif not step.node.endswith('()'):
+                nodes = select_nodes(step.node, nodes)
+
+            # If there is no predicate then keep all nodes.
+            if step.predicate:
+                nodes = filter_nodes(step.predicate, nodes)
+        else:
+            tail = ''.join(str(x) for x in xpath.locs[i:])
+            raise NotImplementedError(
+                f'Some XPath features are not supported at {tail}.')
+    return nodes
+
+
+NodeSet: TypeAlias = Sequence[Mox | Equation]
+
+
+def filter_nodes(predicates: Sequence[LocationPredicate],
+                 node_set: NodeSet) -> NodeSet:
+    def verify(attrs: dict[str, Any]) -> bool:
+        try:
+            return all(p(attrs) for p in predicates)
+        except Exception:
+            return False
+
+    nodes = []
+    for node in node_set:
+        if isinstance(node, Mox):
+            attrs = node.to_dict(False)
+        elif isinstance(node, Equation):
+            attrs = node.to_dict()
+        if verify(attrs):
+            nodes += [node]
+    return tuple(nodes)
+
+
+def select_all_descendants(node_set: NodeSet) -> NodeSet:
+    nodes = [*node_set]
+    for node in node_set:
+        if isinstance(node, Mox):
+            nodes += select_all_descendants(node.children)
+    return tuple(nodes)
+
+
+def select_children(node_set: NodeSet) -> NodeSet:
+    nodes = []
+    for node in node_set:
+        if isinstance(node, Mox):
+            nodes += node.children
+    return tuple(nodes)
+
+
+def select_nodes(name: str, node_set: NodeSet) -> NodeSet:
+    def predicate(node: Expr) -> bool:
+        match node:
+            case Mox():
+                return name == 'module_call'
+            case Equation():
+                return name == node.prim.name
+
+    return tuple([n for n in node_set if predicate(n)])
