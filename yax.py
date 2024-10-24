@@ -16,10 +16,12 @@
 building and querying.
 """
 
+import re
 from dataclasses import dataclass, field, fields
 from functools import partial, wraps
 from io import StringIO
-from typing import IO, Any, Generic, ParamSpec, Sequence, Type, TypeVar
+from typing import (
+    IO, Any, ClassVar, Generic, ParamSpec, Self, Sequence, Type, TypeVar)
 
 import flax
 import flax.linen as nn
@@ -448,8 +450,163 @@ def dump(node: Expr, fileobj: IO[str], *, depth=0):
     print(f'{indent}}}', file=fileobj)
 
 
+@dataclass(slots=True)
+class Token:
+    kind: str
+    value: str = ''
+
+    @property
+    def is_empty(self) -> bool:
+        return self.kind == '' and self.value == ''
+
+    @classmethod
+    def empty(cls) -> Self:
+        return cls('', '')
+
+    def __repr__(self) -> str:
+        if self.is_empty:
+            return 'ε'
+        return f'<{self.kind}>{self.value}'
+
+    def __str__(self) -> str:
+        return self.value or self.kind
+
+    _NODE_TYPE: ClassVar = re.compile(
+        r'(comment|text|processing-instruction|node)')
+
+    _NAME_CHAR: ClassVar = re.compile(r'[0-9A-z_]+')
+
+    _DOUBLE_QUOTED_STR: ClassVar = re.compile(r'"[^"]*"')
+    _SINGLE_QUOTED_STR: ClassVar = re.compile(r"'[^']*'")
+
+    _FULL_NUM: ClassVar = re.compile(r'\d+(\.(\d+)?)?')
+    _FRAC_NUM: ClassVar = re.compile(r'\.(\d+)?')
+
+    _AXIS_NAME: ClassVar = re.compile(
+        r'(ancestor|ancestor-or-self|attribute|child|descendant'
+        r'|descendant-or-self|following|following-sibling|namespace|parent'
+        r'|preceding|preceding-sibling|self)')
+
+
+def tokenize_xpath(val: str):
+    token = Token.empty()
+    while val:
+        while val:
+            if val[0] != ' ':
+                break
+            val = val[:1]
+        val, token = tokenize_expr_token(val, token)
+        yield token
+
+
+def tokenize_expr_token(val: str, last: Token):
+    if val[:1] in '()[]@,':
+        return val[1:], Token(val[:1])
+    elif val[:2] in ('..', '::'):
+        return val[2:], Token(val[:2])
+
+    _PARSERS = (tokenize_name_test, tokenize_node_type, tokenize_node_operator,
+                tokenize_function_name, tokenize_axis_name, tokenize_literal,
+                tokenize_number)
+    for parser in _PARSERS:
+        try:
+            val, token = parser(val, last)
+        except TypeError:
+            pass  # Parser failed to parse: None is parse result.
+        else:
+            return val, token
+
+    raise NotImplementedError(
+        f'Perhaps, this production rule is not implemented at {val[:16]}.')
+
+
+def tokenize_name_test(val: str, last: Token):
+    # If there is a preceding token and the preceding token is not one of @,
+    # ::, (, [, , or an Operator, then a * must be recognized as a
+    # MultiplyOperator and an NCName must be recognized as an OperatorName.
+    if val[:1] == '*':
+        if not last.is_empty and last.kind not in ('@', '::', '(', 'Operator'):
+            return val[1:], Token('Operator', val[:1])
+        else:
+            return val[1:], Token('NameTest', val[:1])
+
+    def tokenize_ncname(val: str) -> str | None:
+        if (m := Token._NAME_CHAR.match(val)) is not None:
+            name = m.group(0)
+            return name
+
+    # NCName ':' '*'
+    if not (name := tokenize_ncname(val)):
+        tail = val[len(name):]
+        if tail[:2] == ':*':
+            return tail[2:], Token('NameTest', f'{name}:*')
+
+    # QName := NCName : NCName
+    if (prefix := tokenize_ncname(val)):
+        tail = val[len(prefix):]
+        if tail[:1] != ':':
+            return tail, Token('NameTest', prefix)
+        if (suffix := tokenize_ncname(tail[1:])):
+            offset = len(prefix) + 1 + len(suffix)
+            return val[offset:], Token('NameTest', f'{prefix}:{suffix}')
+
+
+def tokenize_node_type(val: str, last: Token):
+    if (m := Token._NODE_TYPE.match(val)) is not None:
+        value = m.group(0)
+        return val[len(value):], Token('NodeType', value)
+
+
+def tokenize_node_operator(val: str, last: Token):
+    if val[:3] in ('and', 'or', 'mod', 'div'):
+        return val[3:], Token('Operator', val[:3])
+    elif val[:2] in ('//', '!=', '<=', '>='):
+        return val[2:], Token('Operator', val[:2])
+    elif val[:1] in '*/|+-=':
+        return val[1:], Token('Operator', val[:1])
+
+
+def tokenize_function_name(val: str, last: Token):
+    pass
+
+
+def tokenize_axis_name(val: str, last: Token):
+    if (m := Token._AXIS_NAME.match(val)) is not None:
+        value = m.group(0)
+        return val[len(value):], Token('AxisName', value)
+
+
+def tokenize_literal(val: str, last: Token):
+    for pattern in (Token._DOUBLE_QUOTED_STR, Token._SINGLE_QUOTED_STR):
+        if (m := pattern.match(val)):
+            value = m.group(0)
+            return val[len(value):], Token('Literal', value)
+
+
+def tokenize_number(val: str, last: Token):
+    for pattern in (Token._FULL_NUM, Token._FRAC_NUM):
+        if (m := pattern.match(val)):
+            value = m.group(0)
+            return val[len(value):], Token('Number', value)
+
+
 class XPath:
-    """XPath expression."""
+    """XML Path expression language expression.
+
+    [1]: https://www.w3.org/TR/xpath-10/
+    [1]: https://www.w3.org/TR/xpath-20/
+    [1]: https://www.w3.org/TR/xpath-30/
+    [1]: https://www.w3.org/TR/xpath-31/
+    """
+
+    def __init__(self, xpath: str | Self):
+        if isinstance(xpath, XPath):
+            raise NotImplementedError('Copy constructor.')
+        try:
+            tokens = [*tokenize_xpath(xpath)]
+        except Exception as e:
+            raise RuntimeError(f'Failed to tokenize XPath: {xpath}.') from e
+        print('tokens:', ' '.join(repr(x) for x in tokens))
 
 
 def eval_module(read, write, mox: Mox):
