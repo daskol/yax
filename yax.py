@@ -450,7 +450,7 @@ def dump(node: Expr, fileobj: IO[str], *, depth=0):
     print(f'{indent}}}', file=fileobj)
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, frozen=True)
 class Token:
     kind: str
     value: str = ''
@@ -601,12 +601,12 @@ class XPath:
 
     def __init__(self, xpath: str | Self):
         if isinstance(xpath, XPath):
-            raise NotImplementedError('Copy constructor.')
+            self.tokens = (*xpath.tokens, )
+            return
         try:
-            tokens = [*tokenize_xpath(xpath)]
+            self.tokens = (*tokenize_xpath(xpath), )
         except Exception as e:
             raise RuntimeError(f'Failed to tokenize XPath: {xpath}.') from e
-        print('tokens:', ' '.join(repr(x) for x in tokens))
 
 
 def eval_module(read, write, mox: Mox):

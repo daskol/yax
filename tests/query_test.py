@@ -9,6 +9,7 @@ from yax import tokenize_xpath
     '//[@primitive="module_call"]',
     '//[@primitive="pjit"][@name="relu"]',
     '//[@name="Dense_0"][@features=10]',
+    '//[@name="ResBlock"]//[@features=10]',
 ])
 def test_tokenize_xpath(value: str):
     tokens = tokenize_xpath(value)
