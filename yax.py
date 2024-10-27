@@ -17,6 +17,7 @@ building and querying.
 """
 
 import re
+from copy import deepcopy
 from dataclasses import dataclass, field, fields
 from functools import partial, wraps
 from io import StringIO
@@ -847,10 +848,98 @@ def mtree_map(fn: Callable[[Expr], Any], tree: Mox):
             nodes += reversed(res.children)
 
 
-def mtree_sub(expr: str | XPath, tree: Mox, subtree: Mox) -> Mox:
-    """Substitute a modules or subtrees of `tree` with `subtree` according to
-    matching pattern `expr`.
+SubFn: TypeAlias = Callable[[str, Mox | Jaxpr], Mox | Jaxpr]
+
+
+def mtree_sub(expr: str | XPath, repl: Jaxpr | Mox | SubFn, mox: Mox) -> Mox:
+    """Substitute a module expression `mox` with `repl` according to matching
+    pattern `expr`.
     """
+    # Our substitution algorithm is quite straight forward: find nodes of
+    # interest, verify type integrity, search parents, and finally replace.
+    nodes: list[Equation | Mox] = []
+    for node in mtree_query(expr, mox):
+        if not isinstance(node, Equation | Mox):
+            raise RuntimeError(
+                f'XPath expression does not select a node: {expr}.')
+        nodes += [node]
+
+    for node in nodes:
+        if not (parents := find_parents(mox, node)):
+            raise RuntimeError(
+                'Node owned parential MoX has been substituted.')
+        collection_name = ('params', )
+        collection_name += tuple([p.params['name'] for p in parents[2:]])
+        collection_name += (node.params['name'], )
+        validate_inputs(node.outputs, repl.outputs)
+        validate_outputs(node.outputs, repl.outputs)
+        leaf = deepcopy(repl)
+        leaf.inputs = node.inputs + leaf.inputs[len(node.inputs):]
+        leaf.outputs = node.outputs
+
+
+def find_parents(root: Expr, node: Expr) -> tuple[Mox, ...]:
+    match root:
+        case Equation():
+            return None
+        case Mox():
+            # Try to find `node` in childrens.
+            for expr in root.children:
+                if expr is node:
+                    return (root, )
+            # Otherwise, ask childrens.
+            for expr in root.children:
+                parents = find_parents(expr, node)
+                if parents is not None:
+                    return (root, ) + parents
+
+
+def validate_inputs(old: Equation | Mox, new: Equation | Mox):
+    # TODO(@daskol): Output symbol must be the same. Input symbols are allowed
+    # to increase. So all excessive symbols have to be added to inputs of all
+    # parent module expressions.
+    if isinstance(new, Equation):
+        if len(old.inputs) > len(new.inputs):
+            raise RuntimeError('Replacement has less input symbols: '
+                               f'{len(old.inputs)} > {len(new.inputs)}.')
+        head, tail = new[:len(old.inputs)], new[len(old.inputs):]
+        validate_symbols(old, head)
+        new_symbols, treedef = jax.tree.flatten(tail)
+        return new_symbols, treedef
+    elif isinstance(new, Mox):
+        # Input validation of Mox is litte bit complex: (a) we need to find
+        # weights subtree and replace it with weights tree of replacement; (b)
+        # ...
+        raise NotImplementedError
+
+
+def sub_tree(tree: tuple[list[Any], PyTreeDef],
+             repl: tuple[list[Any], PyTreeDef], path: Sequence[str]):
+    """Substitute parameters subtree in `tree` with new subtree `repl` with
+    respect to subtree root `path`.
+
+    Trees are preseneted as a tuple of leaves and tree structure.
+    """
+
+
+def validate_outputs(actual: list[Symbol], desired: list[Symbol]):
+    # TODO(@daskol): At the moment, we require that number of outputs and
+    # number of output symbols in particular do not change.
+    if len(actual) != len(desired):
+        raise RuntimeError('Number of output symbols differ: '
+                           f'{len(actual.outputs)} vs {len(desired.outputs)}')
+    validate_symbols(actual, desired)
+
+
+def validate_symbols(actual: list[Symbol], desired: list[Symbol]):
+    for pair in zip(actual, desired):
+        lhs, rhs = [s.value for s in pair]
+        if lhs.shape != rhs.shape:
+            raise RuntimeError(
+                f'Symbol shape differ: {lhs.shape} vs {rhs.shape}.')
+        if lhs.dtype != rhs.dtype:
+            raise RuntimeError(
+                f'Symbol dtype differ: {lhs.dtype} vs {rhs.dtype}.')
 
 
 def mtree_query(expr: str | XPath, mox: Mox) -> Sequence[Any]:

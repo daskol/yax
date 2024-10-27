@@ -66,3 +66,34 @@ assert mtree == {SuperMod(): [nn.Identity(), lambda xs: env['xs'] + xs]}сЖц
 ```
 
 In-order graph traversing is equivalent to an abstract avaluation.
+
+### Substitution
+
+Substitution requires the preservation of some invariants.
+
+- Inputs and outputs are reused.
+- New outputs are prohibited for now.
+- New inputs are propagated to root node. There is a difference between Jaxpr
+  (leaf) and Mox (inode).
+
+  - \[Jaxpr\] New inputs are append to all parents.
+  - \[MoX\] Inernal node have two kind of input parameters: plain inputs and
+    weight params. FLAX requires weight params to be the first input parameter.
+    Thus old subtree should be updated with the new one.
+
+  In order to update input parameters, we should update `in_tree` as well.
+  Similarly, update to weight params requires update to `var_tree`. Note that
+  inputs/params handling for root node differs since params are passed
+  explicitely while for all internal expressions params comprises closure
+  context. Surely, any modification of `in_tree` or `var_tree` requires update
+  of input symbols.
+
+  Note, the all parent should be marks as ephemeral. Also, inputs and outputs
+  of a replacement should be type checked agains its predcessors and successors
+  respectively.
+
+  ```python
+  def substitute(parents, expr):
+    for parent in reversed(parents):
+      update_param_tree(parent, expr)
+  ```
