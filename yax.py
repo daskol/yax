@@ -878,6 +878,41 @@ def mtree_sub(expr: str | XPath, repl: Jaxpr | Mox | SubFn, mox: Mox) -> Mox:
         leaf.outputs = node.outputs
 
 
+def update_in_trees_leaf(parents: tuple[Mox, ...], ix: int, repl: Mox):
+    orig = parents[-1].children[ix]
+    if not isinstance(orig, Equation):
+        raise NotImplementedError(
+            'Only equations can be replaced with equations at the moment.')
+
+    arity = len(orig.inputs)
+    orig_syms, aux_syms = repl.inputs[:arity], repl.inputs[arity:]
+    if orig.inputs != orig_syms:
+        raise NotImplementedError(
+            'Original input symbols must be preserved at the moment.')
+
+    for offset, p in enumerate(reversed(parents)):
+        p.entrypoint = None  # Mark as an ephemeral.
+
+        # The first input in the root node is a proper param dict, not a
+        # placeholder for a class instance.
+        print(p.in_tree)
+        print(p.inputs)
+        num_params = p.var_tree.num_leaves
+        params = p.inputs[:num_params]
+        if (len(parents) - offset - 1) > 0:
+            inputs = [object()] + p.inputs[num_params:]  # Scope is the first.
+            args, kwargs = jax.tree.unflatten(p.in_tree, inputs)
+            args += tuple(aux_syms)
+            (_, *p.inputs), p.in_tree = jax.tree.flatten((args, kwargs))
+            p.inputs = params + p.inputs
+        else:
+            args, kwargs = jax.tree.unflatten(p.in_tree, p.inputs)
+            args += tuple(aux_syms)
+            p.inputs, p.in_tree = jax.tree.flatten((args, kwargs))
+        assert params == p.inputs[:num_params], \
+            'Weight params symbols are not preserved.'
+
+
 def find_parents(root: Expr, node: Expr) -> tuple[Mox, ...]:
     match root:
         case Equation():
