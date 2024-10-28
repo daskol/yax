@@ -878,7 +878,7 @@ def mtree_sub(expr: str | XPath, repl: Jaxpr | Mox | SubFn, mox: Mox) -> Mox:
         leaf.outputs = node.outputs
 
 
-def update_in_trees_leaf(parents: tuple[Mox, ...], ix: int, repl: Mox):
+def update_in_trees(parents: tuple[Mox, ...], ix: int, repl: Mox):
     orig = parents[-1].children[ix]
     if not isinstance(orig, Equation):
         raise NotImplementedError(
@@ -895,8 +895,6 @@ def update_in_trees_leaf(parents: tuple[Mox, ...], ix: int, repl: Mox):
 
         # The first input in the root node is a proper param dict, not a
         # placeholder for a class instance.
-        print(p.in_tree)
-        print(p.inputs)
         num_params = p.var_tree.num_leaves
         params = p.inputs[:num_params]
         if (len(parents) - offset - 1) > 0:
@@ -911,6 +909,54 @@ def update_in_trees_leaf(parents: tuple[Mox, ...], ix: int, repl: Mox):
             p.inputs, p.in_tree = jax.tree.flatten((args, kwargs))
         assert params == p.inputs[:num_params], \
             'Weight params symbols are not preserved.'
+
+
+def update_var_trees(parents: tuple[Mox, ...], ix: int, repl: Mox):
+    # Only module expressions have param tree.
+    if not isinstance(repl, Mox):
+        return
+
+    orig = parents[-1].children[ix]
+    orig_name = orig.params.get('name')
+    for p in reversed(parents[1:]):
+        # Restore child tree.
+        num_params = repl.var_tree.num_leaves
+        repl_vars = repl.var_tree.unflatten(repl.inputs[:num_params])
+        repl_name = repl.params.get('name') or f'{repl.module_ty.__name__}_0'
+
+        # Restore parent tree.
+        num_params = p.var_tree.num_leaves
+        variables = p.var_tree.unflatten(p.inputs[:num_params])
+        variables['params'].pop(orig_name)
+
+        # Substitute child subtree in parent.
+        assert repl_name not in variables['params'], \
+            'Duplicated key in variables: fix name generation or fix a tree.'
+        variables['params'][repl_name] = repl_vars['params']
+        inputs, p.var_tree = jax.tree.flatten(variables)
+        p.inputs = inputs + p.inputs[num_params:]
+
+        p.entrypoint = None  # Mark as an ephemeral.
+        orig_name = p.params.get('name')
+        repl = p
+
+    # Restore child var-tree.
+    num_params = repl.var_tree.num_leaves
+    repl_vars = repl.var_tree.unflatten(repl.inputs[:num_params])
+    repl_name = repl.params.get('name') or f'{repl.module_ty.__name__}_0'
+
+    # Restore root in-tree.
+    root = parents[0]
+    (variables, *inputs), kwargs = root.in_tree.unflatten(root.inputs)
+
+    # Update in-place root params.
+    if len(parents) == 1:
+        variables['params'].pop(orig_name)
+    assert repl_name not in variables['params'], \
+        'Duplicated key in variables: fix name generation or fix a tree.'
+    variables['params'].update(repl_vars['params'])
+    args = (variables, *inputs)
+    root.inputs, root.in_tree = jax.tree.flatten((args, kwargs))
 
 
 def find_parents(root: Expr, node: Expr) -> tuple[Mox, ...]:
