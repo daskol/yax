@@ -1,31 +1,52 @@
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Type
 
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import pytest
+from numpy.testing import assert_allclose
 
 from yax import (
-    Equation, Mox, mox as make_mox, mtree_query as query, mtree_sub as sub,
-    update_in_trees, update_var_trees)
+    Equation, Mox, mox as make_mox, mtree_eval as eval_mox,
+    mtree_query as query, mtree_sub as sub, update_in_trees, update_var_trees)
+
+
+@dataclass(slots=True)
+class ModelState:
+    mox: Mox
+    model: nn.Module  # Modified model.
+    params: dict[str, Any]
+    batch: jax.Array
+
+
+class Identity(nn.Module):
+    features: int = 10
+
+    def __call__(self, xs):
+        # TODO(@daskol): Fix tracing or evaluation: duplicated tracer/variable
+        # results in exception on `write` to `env during evaluation.
+        return jnp.array(xs)
 
 
 class ResModule(nn.Module):
     features: int = 10
+    inner_ty: Type[nn.Module] = nn.Dense
 
     @nn.compact
     def __call__(self, xs):
-        return xs + nn.Dense(self.features)(xs)
+        return xs + self.inner_ty(self.features)(xs)
 
 
 @pytest.fixture
 def res_block():
-    model = ResModule()
+    model = ResModule(inner_ty=Identity)
     batch = jnp.ones((1, 10))
     params = jax.jit(model.init)(jax.random.PRNGKey(42), batch)
     mox = make_mox(model.apply)(params, batch)
-    del model, batch, params
-    yield mox
+    modified_model = ResModule(inner_ty=nn.Dense)
+    del model
+    yield ModelState(mox, modified_model, params, batch)
 
 
 @pytest.fixture
@@ -34,8 +55,9 @@ def mlp():
     batch = jnp.ones((1, 4))
     params = jax.jit(model.init)(jax.random.PRNGKey(42), batch)
     mox = make_mox(model.apply)(params, batch)
-    del model, batch, params
-    yield mox
+    modified_model = nn.Sequential([nn.Dense(4), nn.gelu, nn.Dense(2)])
+    del model
+    yield ModelState(mox, modified_model, params, batch)
 
 
 class NestedModule(nn.Module):
@@ -177,25 +199,34 @@ def test_update_var_trees(dummy: Mox):
     assert lhs_tree == rhs_tree, 'Params tree are mismatched'
 
 
-def test_sub_gelu(mlp: Mox):
-    gelu_mox = make_mox(jax.jit(jax.nn.gelu))(jnp.ones((1, 4)))
+def test_sub_equation(mlp: ModelState):
+    gelu_mox = make_mox(jax.jit(jax.nn.gelu))(mlp.batch)
     gelu_expr = gelu_mox.children[0]
     assert isinstance(gelu_expr, Equation)
-    mod = sub('//[@primitive="pjit"][@name="relu"]', gelu_expr, mlp)
-    print('MODIFIED MOX')
-    print(mod)
+    mox = sub('//[@primitive="pjit"][@name="relu"]', gelu_expr, mlp.mox)
+
+    actual = eval_mox(mox, mlp.params, mlp.batch)
+    desired = mlp.model.apply(mlp.params, mlp.batch)
+    assert_allclose(actual, desired)
 
 
-def test_sub_mlp(res_block: Mox):
+def test_sub_mox(res_block: ModelState):
     # TODO(@daskol): Bug in multiple predicates evaluation.
     # nodes = query('//[@primitive="module_call"][@name="layers_0"]', mlp)
     # assert len(nodes) == 1
-    module = nn.Dense(4)
-    params = jax.jit(module.init)(jax.random.PRNGKey(3705), jnp.ones((1, 4)))
+    module = nn.Dense(10)
+    # Firstly, param dictionary must be updated.
+    params = jax.jit(module.init)(jax.random.PRNGKey(3705), res_block.batch)
+    variables = {**res_block.params}
+    variables['params'] = {'Dense_0': params['params']}
+    # Secondly, module expression for substitution must be built.
+    inner_expr = make_mox(module.apply)(params, res_block.batch)
+    inner_mox = inner_expr.children[0]
+    assert isinstance(inner_mox, Mox)
+    # Thirdly, original MoX can be updated.
+    mox = sub('//[@primitive="module_call"][@name="Identity_0"]', inner_mox,
+              res_block.mox)
 
-    mox = make_mox(module.apply)(params, jnp.ones((1, 4)))
-    assert isinstance(mox, Mox)
-
-    mod = sub('//[@primitive="module_call"][@name="layers_0"]', mox, mlp)
-    print('MODIFIED MOX')
-    print(mod)
+    actual = eval_mox(mox, variables, res_block.batch)
+    desired = res_block.model.apply(variables, res_block.batch)
+    assert_allclose(actual, desired)

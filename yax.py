@@ -17,7 +17,7 @@ building and querying.
 """
 
 import re
-from copy import deepcopy
+from copy import copy
 from dataclasses import dataclass, field, fields
 from functools import partial, wraps
 from io import StringIO
@@ -848,13 +848,37 @@ def mtree_map(fn: Callable[[Expr], Any], tree: Mox):
             nodes += reversed(res.children)
 
 
-SubFn: TypeAlias = Callable[[str, Mox | Jaxpr], Mox | Jaxpr]
+ModulePath: TypeAlias = tuple[str, ...]
+
+# SubFn takes a path `path` to a node `node` which has been selected with
+# search query and returns a new node which substitutes original node `node`.
+SubFn: TypeAlias = Callable[[ModulePath, Expr], Expr]
 
 
-def mtree_sub(expr: str | XPath, repl: Jaxpr | Mox | SubFn, mox: Mox) -> Mox:
+def mtree_sub(expr: str | XPath, repl: Mox | Equation | SubFn,
+              mox: Mox) -> Mox:
     """Substitute a module expression `mox` with `repl` according to matching
     pattern `expr`.
     """
+    def default_sub_fn(path: ModulePath, expr: Expr) -> Expr:
+        """Safe module expression modification requires deep copy of nodes.
+        However, abstract values of `Symbol` can contain JAX traceback object
+        which is not deepcopy-able. This is why we shallow-copy `repl` and
+        create new symbols.
+        """
+        obj = copy(repl)
+        obj.inputs = [type(s)(s.value) for s in repl.inputs]
+        obj.outputs = [type(s)(s.value) for s in repl.outputs]
+        return obj
+
+    sub_fn: SubFn
+    if isinstance(repl, Expr):
+        sub_fn = default_sub_fn
+    elif callable(sub_fn):
+        sub_fn = repl
+    else:
+        raise ValueError(f'Unexpected argument `repl` of type {type(repl)}.')
+
     # Our substitution algorithm is quite straight forward: find nodes of
     # interest, verify type integrity, search parents, and finally replace.
     nodes: list[Equation | Mox] = []
@@ -866,26 +890,85 @@ def mtree_sub(expr: str | XPath, repl: Jaxpr | Mox | SubFn, mox: Mox) -> Mox:
 
     for node in nodes:
         if not (parents := find_parents(mox, node)):
-            raise RuntimeError(
-                'Node owned parential MoX has been substituted.')
-        collection_name = ('params', )
-        collection_name += tuple([p.params['name'] for p in parents[2:]])
-        collection_name += (node.params['name'], )
-        validate_inputs(node.outputs, repl.outputs)
-        validate_outputs(node.outputs, repl.outputs)
-        leaf = deepcopy(repl)
-        leaf.inputs = node.inputs + leaf.inputs[len(node.inputs):]
-        leaf.outputs = node.outputs
+            raise RuntimeError(f'No parent found for node {node}.')
+        path = tuple([p.params.get('name') or p.module_ty.__name__
+                      for p in parents[1:]])
+        path += (node.params.get('name') or node.module_ty.__name__, )
+        if (new_node := sub_fn(path, node)) is node:
+            continue
+        sub_node(mox, node, new_node)
+
+    return mox
+
+
+def sub_node(mox: Mox, node: Expr, repl: Equation | Mox):
+    if not (parents := find_parents(mox, node)):
+        raise RuntimeError(f'No parent found for node {node}.')
+
+    *_, parent = parents
+    for ix, child in enumerate(parent.children):
+        if child is node:
+            break
+    else:
+        raise RuntimeError(
+            f'There is no node {node} among childrens of {parent}.')
+
+    rewire_node(node, repl)
+    update_in_trees(parents, ix, repl)
+    update_var_trees(parents, ix, repl)
+    parent.children[ix] = repl
+
+
+def find_parents(root: Expr, node: Expr) -> tuple[Mox, ...]:
+    # TODO(@daskol): We should get rid of `find_parents` and add `parent`
+    # reference to `Expr` type.
+    match root:
+        case Equation():
+            return None
+        case Mox():
+            # Try to find `node` in childrens.
+            for expr in root.children:
+                if expr is node:
+                    return (root, )
+            # Otherwise, ask childrens.
+            for expr in root.children:
+                parents = find_parents(expr, node)
+                if parents is not None:
+                    return (root, ) + parents
+
+
+def rewire_node(node: Expr, repl: Expr):
+    if isinstance(node, Equation):
+        node_inputs = node.inputs
+    elif isinstance(node, Mox):
+        node_inputs = node.inputs[node.var_tree.num_leaves:]
+
+    if isinstance(repl, Equation):
+        repl_params = []
+        repl_inputs = repl.inputs
+    elif isinstance(repl, Mox):
+        repl_params = repl.inputs[:repl.var_tree.num_leaves]
+        repl_inputs = repl.inputs[repl.var_tree.num_leaves:]
+    repl_aux_inputs = repl_inputs[len(node_inputs):]
+
+    # Check types of output symbols and preserved input symbols.
+    validate_symbols(node_inputs, repl_inputs[:len(node_inputs)])
+    validate_symbols(node.outputs, repl.outputs)
+
+    # If there are some input symbols then we preserve as many input symbols as
+    # possible.
+    repl.inputs = repl_params + node_inputs + repl_aux_inputs
+    repl.outputs = node.outputs
 
 
 def update_in_trees(parents: tuple[Mox, ...], ix: int, repl: Mox):
+    if isinstance(repl, Equation):
+        repl_inputs = repl.inputs
+    elif isinstance(repl, Mox):
+        repl_inputs = repl.inputs[repl.var_tree.num_leaves:]
     orig = parents[-1].children[ix]
-    if not isinstance(orig, Equation):
-        raise NotImplementedError(
-            'Only equations can be replaced with equations at the moment.')
-
     arity = len(orig.inputs)
-    orig_syms, aux_syms = repl.inputs[:arity], repl.inputs[arity:]
+    orig_syms, aux_syms = repl_inputs[:arity], repl_inputs[arity:]
     if orig.inputs != orig_syms:
         raise NotImplementedError(
             'Original input symbols must be preserved at the moment.')
@@ -927,12 +1010,14 @@ def update_var_trees(parents: tuple[Mox, ...], ix: int, repl: Mox):
         # Restore parent tree.
         num_params = p.var_tree.num_leaves
         variables = p.var_tree.unflatten(p.inputs[:num_params])
-        variables['params'].pop(orig_name)
+        if 'params' not in variables:
+            variables['params'] = {}
+        variables['params'].pop(orig_name, None)
 
         # Substitute child subtree in parent.
         assert repl_name not in variables['params'], \
             'Duplicated key in variables: fix name generation or fix a tree.'
-        variables['params'][repl_name] = repl_vars['params']
+        variables['params'][repl_name] = repl_vars.get('params', {})
         inputs, p.var_tree = jax.tree.flatten(variables)
         p.inputs = inputs + p.inputs[num_params:]
 
@@ -950,8 +1035,10 @@ def update_var_trees(parents: tuple[Mox, ...], ix: int, repl: Mox):
     (variables, *inputs), kwargs = root.in_tree.unflatten(root.inputs)
 
     # Update in-place root params.
+    if 'params' not in variables:
+        variables['params'] = {}
     if len(parents) == 1:
-        variables['params'].pop(orig_name)
+        variables['params'].pop(orig_name, None)
     assert repl_name not in variables['params'], \
         'Duplicated key in variables: fix name generation or fix a tree.'
     variables['params'].update(repl_vars['params'])
@@ -959,68 +1046,23 @@ def update_var_trees(parents: tuple[Mox, ...], ix: int, repl: Mox):
     root.inputs, root.in_tree = jax.tree.flatten((args, kwargs))
 
 
-def find_parents(root: Expr, node: Expr) -> tuple[Mox, ...]:
-    match root:
-        case Equation():
-            return None
-        case Mox():
-            # Try to find `node` in childrens.
-            for expr in root.children:
-                if expr is node:
-                    return (root, )
-            # Otherwise, ask childrens.
-            for expr in root.children:
-                parents = find_parents(expr, node)
-                if parents is not None:
-                    return (root, ) + parents
-
-
-def validate_inputs(old: Equation | Mox, new: Equation | Mox):
-    # TODO(@daskol): Output symbol must be the same. Input symbols are allowed
-    # to increase. So all excessive symbols have to be added to inputs of all
-    # parent module expressions.
-    if isinstance(new, Equation):
-        if len(old.inputs) > len(new.inputs):
-            raise RuntimeError('Replacement has less input symbols: '
-                               f'{len(old.inputs)} > {len(new.inputs)}.')
-        head, tail = new[:len(old.inputs)], new[len(old.inputs):]
-        validate_symbols(old, head)
-        new_symbols, treedef = jax.tree.flatten(tail)
-        return new_symbols, treedef
-    elif isinstance(new, Mox):
-        # Input validation of Mox is litte bit complex: (a) we need to find
-        # weights subtree and replace it with weights tree of replacement; (b)
-        # ...
-        raise NotImplementedError
-
-
-def sub_tree(tree: tuple[list[Any], PyTreeDef],
-             repl: tuple[list[Any], PyTreeDef], path: Sequence[str]):
-    """Substitute parameters subtree in `tree` with new subtree `repl` with
-    respect to subtree root `path`.
-
-    Trees are preseneted as a tuple of leaves and tree structure.
-    """
-
-
-def validate_outputs(actual: list[Symbol], desired: list[Symbol]):
-    # TODO(@daskol): At the moment, we require that number of outputs and
-    # number of output symbols in particular do not change.
+def validate_symbols(actual: list[Symbol], desired: list[Symbol],
+                     what: str = ''):
+    if what:
+        what = f'{what.capitalize()} symbol'
+    else:
+        what = 'Symbol'
     if len(actual) != len(desired):
-        raise RuntimeError('Number of output symbols differ: '
-                           f'{len(actual.outputs)} vs {len(desired.outputs)}')
-    validate_symbols(actual, desired)
-
-
-def validate_symbols(actual: list[Symbol], desired: list[Symbol]):
+        raise RuntimeError(f'Number of {what.tolower()} differ: '
+                           f'{len(actual)} != {len(desired)}.')
     for pair in zip(actual, desired):
         lhs, rhs = [s.value for s in pair]
         if lhs.shape != rhs.shape:
             raise RuntimeError(
-                f'Symbol shape differ: {lhs.shape} vs {rhs.shape}.')
+                f'{what} shapes differ: {lhs.shape} != {rhs.shape}.')
         if lhs.dtype != rhs.dtype:
             raise RuntimeError(
-                f'Symbol dtype differ: {lhs.dtype} vs {rhs.dtype}.')
+                f'{what} dtypes differ: {lhs.dtype} != {rhs.dtype}.')
 
 
 def mtree_query(expr: str | XPath, mox: Mox) -> Sequence[Any]:
