@@ -33,6 +33,7 @@ requires-python = ">=3.12,<4"
 
 [project.optional-dependencies]
 dev = ["isort", "pytest>=8.2", "ruff"]
+serde = ["ytsaurus-client"]
 test = ["transformers"]
 
 [project.urls]

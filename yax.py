@@ -25,6 +25,8 @@ from json import dumps
 from typing import (
     IO, Any, ClassVar, Generic, ParamSpec, Self, Sequence, Type, TypeAlias,
     TypeVar)
+from xml.etree.ElementTree import (
+    Element, ElementTree, SubElement, indent as indent_etree)
 
 import flax
 import flax.linen as nn
@@ -43,8 +45,8 @@ try:
 except ImportError:
     from jax.tree_util import PyTreeDef
 
-__all__ = ('Equation', 'Expr', 'Literal', 'Mox', 'Symbol', 'Var', 'eval_mox',
-           'make_mox', 'map_mox', 'query', 'sub')
+__all__ = ('Equation', 'Expr', 'Literal', 'Mox', 'Symbol', 'Var', 'dump_yson',
+           'dump_xml', 'eval_mox', 'make_mox', 'map_mox', 'query', 'sub')
 
 # TODO(@daskol): Python 3.12 introduced new type parameter syntax (PEP-0695)
 # but some code quality tools (e.g. yapf) do not support this syntax.
@@ -490,6 +492,104 @@ def dump(node: Expr, fileobj: IO[str], *, depth=0):
                 print(f'{indent}  outputs={child.outputs}', file=fileobj)
                 print(f'{indent}  {child}', file=fileobj)
     print(f'{indent}}}', file=fileobj)
+
+
+def dump_yson(expr: Expr, fileobj: IO[bytes], indent: int = 2):
+    """Serialize module expression `expr` as a YSON-formatted object to
+    `fileobj`.
+    """
+    try:
+        from yt.yson import YsonEntity, YsonList, YsonType, dump
+    except ImportError as e:
+        msg = (
+            'Missing YSON packages. Try to install `ytsaurus-client` package '
+            'for basic YSON support and `ytsaurus-yson` for fast serialization'
+            '/deserialization.')
+        raise RuntimeError(msg) from e
+
+    def fmt(val):
+        if isinstance(val, bool | int | float):
+            return val
+        elif isinstance(val, Jaxpr):
+            return val.pretty_print(use_color=False)
+        elif callable(val):
+            return f'{val.__module__}.{val.__name__}'
+        elif hasattr(val, 'dtype'):
+            return str(val.dtype)
+        else:
+            return str(val)
+
+    def to_yson(expr: Expr) -> YsonType:
+        if isinstance(expr, Mox):
+            root = YsonList([])
+            root.attributes['primitive'] = 'module_call'
+            root.attributes['ephemeral'] = fmt(expr.is_ephemeral)
+            if expr.module_ty:
+                root.attributes['type'] = expr.module_ty.__name__
+            root.extend(to_yson(child) for child in expr.children)
+        elif isinstance(expr, Equation):
+            root = YsonEntity()
+            root.attributes['primitive'] = expr.prim.name
+        else:
+            raise RuntimeError('Unexpected expression type {type(expr)}.')
+        root.attributes.update({
+            k: fmt(v)
+            for k, v in expr.params.items() if v is not None
+        })
+        return root
+
+    root = to_yson(expr)
+    kwargs = {}
+    if indent > 0:
+        kwargs = dict(yson_format='pretty', indent=indent)
+    dump(root, fileobj, **kwargs)
+
+
+def dump_xml(expr: Expr, fileobj: IO[str], indent: int = 2):
+    """Serialize module expression `expr` to XML representation."""
+
+    def fmt(val):
+        if isinstance(val, bool):
+            return str(val).lower()
+        elif isinstance(val, Jaxpr):
+            return val.pretty_print(use_color=False)
+        elif callable(val):
+            return f'{val.__module__}.{val.__name__}'
+        elif hasattr(val, 'dtype'):
+            return str(val.dtype)
+        else:
+            return str(val)
+
+    def build_subtree(parent: Element, node: Expr):
+        attrs = {}
+        if isinstance(node, Mox):
+            tag = 'module_call'
+            attrs['type'] = node.module_ty.__name__
+            attrs['ephemeral'] = fmt(node.is_ephemeral)
+        elif isinstance(node, Equation):
+            tag = node.prim.name
+        attrs.update({
+            k: fmt(v)
+            for k, v in node.params.items() if v is not None
+        })
+        elem = SubElement(parent, tag, attrs)
+        if isinstance(node, Mox):
+            for child in node.children:
+                build_subtree(elem, child)
+
+    if isinstance(expr, Mox):
+        root = Element('module_call', attrib={'ephemeral': 'true'})
+        for child in expr.children:
+            build_subtree(root, child)
+    elif isinstance(expr, Equation):
+        root = Element(expr.prim.name, attrib={})
+    else:
+        raise RuntimeError('Unexpected expression type {type(expr)}.')
+
+    et = ElementTree(root)
+    if indent:
+        indent_etree(et, space=' ' * indent)
+    et.write(fileobj, encoding='unicode', xml_declaration=True)
 
 
 @dataclass(slots=True, frozen=True)
