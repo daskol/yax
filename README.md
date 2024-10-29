@@ -150,8 +150,7 @@ XML is actually a good and even appropriate serialization format.
 [YSON][1] stands for Yandex Serialization Object Notation. It is a
 serialization format similar to JSON due to its compact notation but is more
 expressive. In terms of representational expressiveness, YSON is comparable to
-XML. In addition to its textual wire representation, YSON also has a binary
-format, making it comparable to [MessagePack][2] or [Protobuf][3].
+XML.
 
 ```yson
 <primitive="module_call";
