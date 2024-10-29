@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """Module `yax` implements module tracing routines, module expression (MoX)
-building and querying.
+building, querying, and mutation.
 """
 
 import re
@@ -43,8 +43,8 @@ try:
 except ImportError:
     from jax.tree_util import PyTreeDef
 
-__all__ = ('Equation', 'Expr', 'Literal', 'Mox', 'Var', 'Symbol', 'mox',
-           'mtree_map', 'mtree_query', 'mtree_sub')
+__all__ = ('Equation', 'Expr', 'Literal', 'Mox', 'Symbol', 'Var', 'eval_mox',
+           'make_mox', 'map_mox', 'query', 'sub')
 
 # TODO(@daskol): Python 3.12 introduced new type parameter syntax (PEP-0695)
 # but some code quality tools (e.g. yapf) do not support this syntax.
@@ -227,6 +227,8 @@ _ = {
 
 @dataclass(slots=True)
 class Expr:
+    """A base type that represents a module tree structure."""
+
     inputs: list[Symbol]
     outputs: list[Symbol]
     params: dict[str, Any]
@@ -234,6 +236,10 @@ class Expr:
 
 @dataclass(slots=True)
 class Equation(Expr):
+    """A leaf of module tree that refers to a JAX
+    :class:`jax.extend.core.Primitive`.
+    """
+
     prim: jex.core.Primitive
 
     def to_dict(self, recursively=True) -> dict[str, Any]:
@@ -297,14 +303,14 @@ class Mox(Expr):
                      default=default)
 
 
-def mox(fn: Callable[Args, Any]) -> Callable[Args, Mox]:
+def make_mox(fn: Callable[Args, Any]) -> Callable[Args, Mox]:
     """Make a tracing routine for `fn` to obtaine its Module eXpression
     (MoX).
 
     >>> m = nn.Dense(10)
     >>> batch = jnp.empty((1, 10))
     >>> params = jax.jit(m.init)(jax.random.PRNGKey(42), batch)
-    >>> mtree = mox(m.apply)(params, batch)
+    >>> mox = make_mox(m.apply)(params, batch)
     """
     @wraps(fn)
     def wrapper(*args: Args.args, **kwargs: Args.kwargs) -> Mox:
@@ -801,7 +807,7 @@ def eval_equation(read, write, eq: Equation):
         write(sym, val)
 
 
-def mtree_eval(tree: Mox, *args, **kwargs):
+def eval_mox(tree: Mox, *args, **kwargs):
     """Evaluate a module expression `tree` with `args` and `kwargs`."""
     env: dict[Symbol, Any] = {}
 
@@ -831,7 +837,7 @@ def mtree_eval(tree: Mox, *args, **kwargs):
     assert in_tree == tree.in_tree, \
         f'Arguments and input tree mismatched: {in_tree} vs {tree.in_tree}.'
     jax.tree.map(write, tree.inputs, flat_args)
-    mtree_map(fn, tree)
+    map_mox(fn, tree)
 
     flatten_res = [read(x) for x in tree.outputs]
     if len(flatten_res) == 1:
@@ -839,7 +845,7 @@ def mtree_eval(tree: Mox, *args, **kwargs):
     return flatten_res
 
 
-def mtree_map(fn: Callable[[Expr], Any], tree: Mox):
+def map_mox(fn: Callable[[Expr], Any], tree: Mox):
     """Apply map transformation `fn` to a module `tree`."""
     nodes: list[Expr] = [tree]
     while nodes:
@@ -855,10 +861,17 @@ ModulePath: TypeAlias = tuple[str, ...]
 SubFn: TypeAlias = Callable[[ModulePath, Expr], Expr]
 
 
-def mtree_sub(expr: str | XPath, repl: Mox | Equation | SubFn,
-              mox: Mox) -> Mox:
+def sub(expr: str | XPath, repl: Mox | Equation | SubFn, mox: Mox) -> Mox:
     """Substitute a module expression `mox` with `repl` according to matching
     pattern `expr`.
+
+    Args:
+      expr: XPath expression for nodes to substitute.
+      repl: replacement for selected nodes.
+      mox: a module expression to mutate.
+
+    Return:
+      Modified module expression (MoX).
     """
     def default_sub_fn(path: ModulePath, expr: Expr) -> Expr:
         """Safe module expression modification requires deep copy of nodes.
@@ -882,7 +895,7 @@ def mtree_sub(expr: str | XPath, repl: Mox | Equation | SubFn,
     # Our substitution algorithm is quite straight forward: find nodes of
     # interest, verify type integrity, search parents, and finally replace.
     nodes: list[Equation | Mox] = []
-    for node in mtree_query(expr, mox):
+    for node in query(expr, mox):
         if not isinstance(node, Equation | Mox):
             raise RuntimeError(
                 f'XPath expression does not select a node: {expr}.')
@@ -1065,17 +1078,18 @@ def validate_symbols(actual: list[Symbol], desired: list[Symbol],
                 f'{what} dtypes differ: {lhs.dtype} != {rhs.dtype}.')
 
 
-def mtree_query(expr: str | XPath, mox: Mox) -> Sequence[Any]:
+def query(expr: str | XPath, mox: Mox) -> Sequence[Any]:
     """Get modules or their properties by XPath expression.
 
     >>> class ResBlock(nn.Module):
     >>>     @nn.compact
     >>>     def __call__(self, xs):
     >>>         return xs + nn.Dense(10)(xs)
-    >>> mtree = mox(ResBlock().init)(jax.random.PRNGKey(42),
-    >>>                              jnp.empty((2, 10))
+    >>>
+    >>> mox = make_mox(ResBlock().init)(jax.random.PRNGKey(42),
+    >>>                                 jnp.empty((2, 10))
     >>> # Query all modules with 10 output features.
-    >>> mtree_query('//[@features=10]')
+    >>> query('//[@features=10]')
     [nn.Dense(10)]
     """
     xpath = XPath(expr)

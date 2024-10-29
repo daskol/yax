@@ -24,7 +24,7 @@ from jax import Array
 from jax.extend.core import ClosedJaxpr, primitives
 from numpy.testing import assert_allclose
 
-from yax import Equation, Mox, mox, mox as make_mox, mtree_eval
+from yax import Equation, Mox, eval_mox, make_mox
 
 
 @pytest.mark.parametrize('fn', [
@@ -38,7 +38,7 @@ class TestBinaryFunc:
     def test_make(self, fn):
         xs = jnp.ones(3)
         ys = jnp.ones(3)
-        mtree = mox(fn)(xs, ys)
+        mtree = make_mox(fn)(xs, ys)
 
         assert isinstance(mtree, Mox)
         assert mtree.is_ephemeral
@@ -60,8 +60,8 @@ class TestBinaryFunc:
     def test_eval(self, fn):
         xs = jnp.ones(3)
         ys = jnp.ones(3)
-        mtree = mox(fn)(xs, ys)
-        actual = mtree_eval(mtree, xs, ys)
+        mtree = make_mox(fn)(xs, ys)
+        actual = eval_mox(mtree, xs, ys)
         desired = fn(xs, ys)
         assert_allclose(actual, desired)
 
@@ -100,7 +100,7 @@ class TestBinaryModule:
         model = FuncModule(fn)
         params = jax.jit(model.init)(key, *batch)
 
-        mtree = mox(model.apply)(params, *batch)
+        mtree = make_mox(model.apply)(params, *batch)
         assert isinstance(mtree, Mox)
         assert mtree.is_ephemeral
         assert len(mtree.children) == 1
@@ -114,8 +114,8 @@ class TestBinaryModule:
     def test_eval(self, fn):
         xs = jnp.ones(3)
         ys = jnp.ones(3)
-        mtree = mox(fn)(xs, ys)
-        actual = mtree_eval(mtree, xs, ys)
+        mtree = make_mox(fn)(xs, ys)
+        actual = eval_mox(mtree, xs, ys)
         desired = fn(xs, ys)
         assert_allclose(actual, desired)
 
@@ -132,7 +132,7 @@ class TestStatefulModule:
         yield ModelState(model, params, batch)
 
     def test_make(self, state: ModelState):
-        mtree = mox(state.model.apply)(state.params, state.batch)
+        mtree = make_mox(state.model.apply)(state.params, state.batch)
         assert isinstance(mtree, Mox)
         assert mtree.is_ephemeral
         assert len(mtree.children) == 1
@@ -143,8 +143,8 @@ class TestStatefulModule:
         assert len(subtree.outputs) == 1
 
     def test_eval(self, state: ModelState):
-        mtree = mox(state.model.apply)(state.params, state.batch)
-        actual = mtree_eval(mtree, state.params, state.batch)
+        mtree = make_mox(state.model.apply)(state.params, state.batch)
+        actual = eval_mox(mtree, state.params, state.batch)
         desired = state.model.apply(state.params, state.batch)
         assert_allclose(actual, desired)
 
@@ -172,7 +172,7 @@ class TestResBlock:
         yield ModelState(model, params, batch)
 
     def test_make(self, state: ModelState):
-        mtree = mox(state.model.apply)(state.params, state.batch)
+        mtree = make_mox(state.model.apply)(state.params, state.batch)
         assert isinstance(mtree, Mox)
         assert mtree.is_ephemeral
         assert len(mtree.children) == 1
@@ -183,8 +183,8 @@ class TestResBlock:
         assert len(subtree.outputs) == 1
 
     def test_eval(self, state: ModelState):
-        mtree = mox(state.model.apply)(state.params, state.batch)
-        actual = mtree_eval(mtree, state.params, state.batch)
+        mtree = make_mox(state.model.apply)(state.params, state.batch)
+        actual = eval_mox(mtree, state.params, state.batch)
         desired = state.model.apply(state.params, state.batch)
         assert_allclose(actual, desired)
 
@@ -211,11 +211,11 @@ class TestHFModels:
             .from_pretrained('roberta-base')
 
         input_ids = jnp.ones((1, 3), dtype=jnp.int32)
-        mtree = mox(model)(input_ids=input_ids, params=model.params)
+        mtree = make_mox(model)(input_ids=input_ids, params=model.params)
 
-        # TODO(@daskol): Reference evaluation returns a dataclass object while
-        # we do not preserve it. Is it okay?
-        actual = mtree_eval(mtree, input_ids=input_ids, params=model.params)
+        # TODO(@daskol): Reference evaluation returns a dataclass object but
+        # not a dict while we do not preserve it. Is it okay?
+        actual = eval_mox(mtree, input_ids=input_ids, params=model.params)
         desired, *_ = model(input_ids=input_ids, params=model.params,
                             return_dict=False)
         assert_allclose(actual, desired)

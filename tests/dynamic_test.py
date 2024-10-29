@@ -21,8 +21,7 @@ import pytest
 from jax.core import ConcreteArray, ShapedArray
 from numpy.testing import assert_allclose
 
-from yax import (
-    Literal, Mox, Symbol, Var, mox as make_mox, mtree_eval as eval_mox)
+from yax import Literal, Mox, Symbol, Var, eval_mox, make_mox
 
 
 def assert_empty(mox):

@@ -4,7 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "yax"
-description = "Yet Another X library: JAX/FLAX module tracing."
+description = """
+Yet Another X: JAX/FLAX module tracing, modification, and evaluation."""
 license = {text = "Apache-2.0"}
 authors = [
     {name = "Daniel Bershatsky", email = "daniel.bershatsky@gmail.com"},

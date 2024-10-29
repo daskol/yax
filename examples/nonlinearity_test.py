@@ -20,7 +20,7 @@ import jax.numpy as jnp
 from jax import Array
 from numpy.testing import assert_allclose
 
-from yax import Mox, mox as make_mox, mtree_eval as eval_mox, mtree_sub
+from yax import Mox, eval_mox, make_mox, sub
 
 ActivationFn: TypeAlias = Callable[[Array], Array]
 
@@ -53,7 +53,7 @@ def test_nonlinearity():
     mox_relu: Mox = make_mox(model_relu.apply)(params, batch)
 
     # 3. Substitute all `relu` activation functions with `gelu`.
-    mox = mtree_sub('//pjit[@name="relu"]', mox_relu, jax.nn.gelu)
+    mox = sub('//pjit[@name="relu"]', mox_relu, jax.nn.gelu)
     print(mox)
 
     # 4. Compare inference of modified `mox` against `mox_gelu` initialized

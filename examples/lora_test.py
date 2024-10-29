@@ -19,7 +19,7 @@ import pytest
 from flax.linen.initializers import lecun_normal, zeros_init
 from flax.typing import Dtype, Initializer, PrecisionLike
 
-from yax import Mox, mox, mtree_sub
+from yax import Mox, make_mox, sub
 
 
 class LoRA(nn.Module):
@@ -71,7 +71,7 @@ def test_lora():
     params = jax.jit(model.init)(subkey, batch)
 
     # 2. Build a module expression.
-    mtree: Mox = mox(model.apply)(params, batch)
+    mtree: Mox = make_mox(model.apply)(params, batch)
 
     # 3. Initialize LoRA-adapter.
     adapter = LoRA(features=10, rank=2)
@@ -84,7 +84,7 @@ def test_lora():
     params['params']['LoRA_0'] = {**adapter_params, 'Dense_0': dense_params}
 
     # 5. Substitute (single) dense layer with LoRA-adapter.
-    mtree_lora = mtree_sub('//[type="Dense"]', mtree, adapter)
+    mtree_lora = sub('//[type="Dense"]', mtree, adapter)
 
     # TODO(@daskol): Present new module and weight tree. What about optimizer
     # state?

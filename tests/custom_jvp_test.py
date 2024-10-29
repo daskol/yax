@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import pytest
 from numpy.testing import assert_allclose
 
-from yax import Mox, mox as make_mox, mtree_eval as eval_mox
+from yax import Mox, eval_mox, make_mox
 
 
 class Model(nn.Module):
