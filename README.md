@@ -10,26 +10,31 @@
 
 ## Overview
 
-Deep learning frameworks like PyTorch, Keras, or even JAX/FLAX usually provides
-a "module-level" API, i.e. an abstraction of layer, an architecture unit in a
-neural network. Modules are descriptive and easy to use but sometimes they are
-quite inconvenient to work with programmatically. Specifically, it is tricky to
-change model architecture on-fly while changing weight structure on-fly is not
-a big deal. So why can't we work with modules in the same way?
+Deep learning frameworks like PyTorch, Keras, and JAX/FLAX usually provide a
+"module-level" API, which abstracts a layer—an architectural unit in a neural
+network. While modules are descriptive and easy to use, they can sometimes be
+inconvenient to work with programmatically. Specifically, it is challenging to
+modify model architecture on the fly, though changing weight structures
+dynamically is not as difficult. So, why can't we work with modules in the same
+flexible way?
 
-**YAX** is a library in JAX/FLAX ecosystem to build, evaluate, and modify
-intermediate representation of a modular structure of neural network. Modular
-structure are represented with help of MoX, a Module eXpression, which is is an
-extension of JAX expressions (Jaxpr). MoX is pronounced as \[*mokh*\] and means
-moss in Russian.
+YAX is a library within the JAX/FLAX ecosystem for building, evaluating, and
+modifying the intermediate representation of a neural network's modular
+structure. Modular structures are represented with the help of MoX, a Module
+eXpression, which is an extension of JAX expressions (Jaxpr). MoX is pronounced
+as ∗[mokh]∗ and means "moss" in Russian.
+
+```bash
+pip install git+https://github.com/daskol/yax.git
+```
 
 ## Usage
 
-Module expressions (MoX) are extremely usefull in some situations. For example,
-applying a custom LoRA-like adapter or model performance optimization like
-quantized gradient activation functions (see [fewbit][4]). However, we briefly
-discuss what YAX/MoX are capable of. We will use the `ResBlock` below for
-further demonstrations.
+Module expressions (MoX) are extremely useful in certain situations. For
+example, they enable the application of custom LoRA-like adapters or model
+performance optimizations, such as quantized gradient activation functions (see
+[fewbit][4]). We've briefly discussed what YAX/MoX can accomplish, and we’ll
+use the ResBlock below for further demonstrations.
 
 ```python
 import flax.linen as nn
@@ -38,39 +43,41 @@ import yax
 class ResBlock(nn.Module):
     @nn.compact
     def __call__(self, xs):
-        return xs + nn.Dense(4)(xs)
+        return xs + nn.Dense(10)(xs)
 
 mod = ResBlock()
-batch = jnp.empty(1, 4)
+batch = jnp.empty(1, 10)
 params = jax.jit(mod.init)(jax.random.PRNGKey(42), batch)
 ```
 
-**Tracing** First of all, we should build a module representation (aka MoX). It
-can be done similarly to making Jaxpr (see `jax.make_jaxpr`).
+**Tracing** First, we need to build a module representation (also known as
+MoX). This can be done in a similar way to creating a Jaxpr (see
+`jax.make_jaxpr`).
 
 ```python
 mox = yax.make_mox(mod.apply)(params, batch)
 print(mox)
 ```
 
-Pretty printing is not available for MoX at the moment but it will look like
-the following.
+Pretty printing is is not very pretty for MoX at the moment but it will look
+like the following. Also, we have implemented serialization to XML and YSON
+(see Serialization section).
 
 ```jaxpr
-{ lambda ; a:f32[4] b:f32[4,4] c:f32[1,4]. let
-  d:f32[1,4] = module_call {
-    lambda ; a:f32[4] b:f32[4,4] c:f32[1,4]. let
-      d:f32[1,4] = dot_general[dimension_numbers=(([1], [0]), ([], []))] c b
-      e:f32[1,4] = reshape[dimensions=None new_sizes=(1, 4)] a
-      f:f32[1,4] = add d e
+{ lambda ; a:f32[10] b:f32[10,10] c:f32[1,10]. let
+  d:f32[1,10] = module_call {
+    lambda ; a:f32[10] b:f32[10,10] c:f32[1,10]. let
+      d:f32[1,10] = dot_general[dimension_numbers=(([1], [0]), ([], []))] c b
+      e:f32[1,10] = reshape[dimensions=None new_sizes=(1, 10)] a
+      f:f32[1,10] = add d e
     in (f,) }
-  e:f32[1,4] = add d a
+  e:f32[1,10] = add d a
   in (e,)}
 ```
 
-**Evaluation** MoX can be evaluated similarly to Jaxpr but the most important
-thing is that `yax.eval_mox` is composable with common JAX transformation in
-the following way.
+**Evaluation** MoX can be evaluated similarly to Jaxpr, but the most important
+feature is that `yax.eval_mox` can be composed with common JAX transformations,
+as shown below.
 
 ```python
 def apply(params, batch):
@@ -80,23 +87,23 @@ _ = apply(params, batch)  # Greedy evaluation.
 _ = jax.jit(apply)(params, batch)  # JIT-compiled execution.
 ```
 
-**Querying** MoX provides facility for model exploration and examination.
-Specifically, MoX helps to answer for the following kind of questions: What
-does `nn.Dense` module have `10` features?
+**Querying** MoX provides tools for model exploration and examination.
+Specifically, MoX can help answer questions like: "What `nn.Dense` modules have
+10 features?"
 
 ```python
 modules: Sequence[yax.Mox] = yax.query('//module_call[@features=10]', mox)
 ```
 
-We use XPath (same old XML Path expression language) for writing requests.
-XPath is a brief and convient way to expression search conditions. In fact,
-module tree can be represented with respect to DOM which excelently represents
-nested structure of a neural network as well as module attributes in internal
-nodes.
+We use XPath (the familiar XML Path expression language) for writing queries.
+XPath is a concise and convenient way to express search conditions. In fact,
+the module tree can be represented similarly to a DOM structure, which
+effectively models the nested structure of a neural network as well as the
+module attributes in its internal nodes.
 
-**Modification** With such expressive query language, it is easy to change an
-original model on-the-fly. For example, one can change all ReLU activation
-functions with GELU or replace all `nn.Dense` layers with LoRA-adapters.
+**Modification** With such an expressive query language, modifying an original
+model on the fly becomes easy. For example, one can replace all ReLU activation
+functions with GELU or substitute all `nn.Dense` layers with LoRA adapters.
 
 ```python
 # Replace ReLU with GELU
@@ -114,9 +121,9 @@ modified_mox = yax.sub('//module_call[@type="Dense"]', lora_mox, mox)
 
 ### XML
 
-The most funny part about MoX is that MoX can be serialized to XML. Barely,
-nobody uses XML nowdays outside Java ecosystem and some projects with long
-history. However, XML is actually a good and even right serialization format.
+The funniest part about MoX is that it can be serialized to XML. Hardly anyone
+uses XML nowadays outside the Java ecosystem and some legacy projects. However,
+XML is actually a good and even appropriate serialization format.
 
 ```xml
 <module_call type="flax.nn.Dense" name="Dense_0" features="10">
@@ -141,10 +148,10 @@ history. However, XML is actually a good and even right serialization format.
 ### YSON
 
 [YSON][1] stands for Yandex Serialization Object Notation. It is a
-serialization format similar to JSON due to its compact notation but more
-expressive. Regarding to expressivity of representation, YSON is comparable to
-XML. Besides textual wire representation, YSON has a binary one as well. This
-that makes it something comparable to [MessagePack][2] or [Protobuf][3].
+serialization format similar to JSON due to its compact notation but is more
+expressive. In terms of representational expressiveness, YSON is comparable to
+XML. In addition to its textual wire representation, YSON also has a binary
+format, making it comparable to [MessagePack][2] or [Protobuf][3].
 
 ```yson
 <primitive="module_call";
@@ -197,3 +204,5 @@ Substitution requires the preservation of some invariants.
     for parent in reversed(parents):
       update_param_tree(parent, expr)
   ```
+- Compositionality with `jax.scan`, `jax.vmap`, and `jax.pmap` is not verified.
+- Pretty printing of module expressions is not available for now.
