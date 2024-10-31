@@ -22,7 +22,7 @@ import pytest
 from numpy.testing import assert_allclose
 
 from yax import (
-    Equation, Mox, eval_mox, make_mox, query, sub, update_in_trees,
+    Equation, Expr, Mox, eval_mox, make_mox, query, sub, update_in_trees,
     update_var_trees)
 
 
@@ -211,6 +211,20 @@ def test_update_var_trees(dummy: Mox):
     _, lhs_tree = jax.tree.flatten(lhs_params)
     _, rhs_tree = jax.tree.flatten(rhs_params)
     assert lhs_tree == rhs_tree, 'Params tree are mismatched'
+
+
+def test_sub_callable(mlp: ModelState):
+    """Ensure that`sub` follows `re.sub` and accepts function as `repl`."""
+    def sub_fn(path: tuple[str, ...], node: Expr) -> Expr:
+        gelu_mox = make_mox(jax.jit(jax.nn.gelu))(mlp.batch)
+        gelu_expr = gelu_mox.children[0]
+        assert isinstance(gelu_expr, Equation)
+        return gelu_expr
+
+    mox = sub('//[@primitive="pjit"][@name="relu"]', sub_fn, mlp.mox)
+    actual = eval_mox(mox, mlp.params, mlp.batch)
+    desired = mlp.model.apply(mlp.params, mlp.batch)
+    assert_allclose(actual, desired)
 
 
 def test_sub_equation(mlp: ModelState):

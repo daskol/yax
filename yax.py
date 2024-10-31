@@ -987,7 +987,7 @@ def sub(expr: str | XPath, repl: Mox | Equation | SubFn, mox: Mox) -> Mox:
     sub_fn: SubFn
     if isinstance(repl, Expr):
         sub_fn = default_sub_fn
-    elif callable(sub_fn):
+    elif callable(repl):
         sub_fn = repl
     else:
         raise ValueError(f'Unexpected argument `repl` of type {type(repl)}.')
