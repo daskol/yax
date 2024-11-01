@@ -12,14 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import deepcopy
+from itertools import count
+
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
-import pytest
 from flax.linen.initializers import lecun_normal, zeros_init
 from flax.typing import Dtype, Initializer, PrecisionLike
+from numpy.testing import assert_allclose
 
-from yax import Mox, make_mox, sub
+from yax import Expr, Mox, eval_mox, make_mox, sub
 
 
 class LoRA(nn.Module):
@@ -36,12 +39,12 @@ class LoRA(nn.Module):
 
     @nn.compact
     def __call__(self, xs):
-        out_features = jnp.shape(xs)[-1]
+        in_features = jnp.shape(xs)[-1]
 
-        lhs_shape = (self.features, self.rank)
+        lhs_shape = (in_features, self.rank)
         lhs = self.param('lhs', self.lhs_init, lhs_shape, self.param_dtype)
 
-        rhs_shape = (out_features, self.rank)
+        rhs_shape = (self.features, self.rank)
         rhs = self.param('rhs', self.rhs_init, rhs_shape, self.param_dtype)
 
         # NOTE Contraction order is important. See also
@@ -53,39 +56,70 @@ class LoRA(nn.Module):
 class Model(nn.Module):
     @nn.compact
     def __call__(self, xs):
-        ys = nn.Conv(10, 3)(xs)
-        ys = nn.relu(ys)
-        ys = nn.Dense(10)(ys)
-        return ys
+        ys = nn.Dense(10)(xs)
+        zs = nn.relu(ys)
+        return nn.Dense(2)(zs)
 
 
-@pytest.mark.xfail(reason='no jvp support')
 def test_lora():
-    """A use case of substituting a affine layer with LoRA-adapter."""
-    batch = jnp.empty((1, 10))
+    """A use case of substituting an affine layers with LoRA-adapters."""
+    batch = jnp.ones((1, 10))
     key = jax.random.PRNGKey(42)
+    lora_ix = (f'LoRA_{ix}' for ix in count())  # Name LoRA-adapters.
 
     # 1. Build and intialize model.
     model = Model()
     key, subkey = jax.random.split(key)
-    params = jax.jit(model.init)(subkey, batch)
+    model_params = jax.jit(model.init)(subkey, batch)
 
-    # 2. Build a module expression.
-    mtree: Mox = make_mox(model.apply)(params, batch)
+    # 2. Build a module expression of the original model.
+    mox: Mox = make_mox(model.apply)(model_params, batch)
+    xs = eval_mox(mox, model_params, batch)
 
-    # 3. Initialize LoRA-adapter.
-    adapter = LoRA(features=10, rank=2)
-    _, subkey = jax.random.split(key)
-    adapter_params = jax.jit(adapter.init)(subkey, batch)
+    def sub_fn(path: tuple[str, ...], node: Expr) -> Expr:
+        if not isinstance(node, Mox):
+            return node
 
-    # 4. Substitute dense weight tree with LoRA-adapter weights.
-    # TODO(@daskol): What is the easiest? Flatten/unflatten?
-    dense_params = params['params'].pop('Dense_0')
-    params['params']['LoRA_0'] = {**adapter_params, 'Dense_0': dense_params}
+        features: int
+        if (features := node.params.get('features')) is None:
+            raise RuntimeError(f'No `features` attribute: {node}.')
+        inputs = node.inputs[node.var_tree.num_leaves:]
+        in_shape = inputs[0].value.shape
+        *_, name = path
+
+        # 3. Initialize LoRA-adapter.
+        nonlocal key
+        key, subkey = jax.random.split(key)
+        batch = jnp.ones(in_shape)
+        adapter = LoRA(features=features, rank=2)
+        adapter_name = next(lora_ix)
+        adapter_params = jax.jit(adapter.init)(subkey, batch)
+
+        # 4. Substitute dense weight tree with LoRA-adapter weights.
+        # TODO(@daskol): What is the easiest? Flatten/unflatten?
+        lora_params['params'][adapter_name] = {
+            **adapter_params['params'],
+            'Dense_0': lora_params['params'].pop(name),
+        }
+
+        # 5. Build a module expression for new LoRA-adapter.
+        mox = make_mox(adapter.apply)(adapter_params, batch)
+        mox = mox.children[0]
+        mox.params['name'] = adapter_name  # Must be unique in node.
+        return mox
 
     # 5. Substitute (single) dense layer with LoRA-adapter.
-    mtree_lora = sub('//[type="Dense"]', mtree, adapter)
+    lora_params = deepcopy(model_params)
+    lora_mox = sub('//[@type="Dense"]', sub_fn, mox)
 
-    # TODO(@daskol): Present new module and weight tree. What about optimizer
-    # state?
-    print(mtree_lora)
+    # 6. Apply LoRA-adapted model without and with JIT.
+    ys = eval_mox(lora_mox, lora_params, batch)
+    assert_allclose(ys, xs)
+
+    def apply(params, batch):
+        return eval_mox(lora_mox, lora_params, batch)
+
+    zs = jax.jit(apply)(lora_params, batch)
+    assert_allclose(zs, xs, atol=1e-6)
+
+    # TODO(@daskol): What about optimizer state?

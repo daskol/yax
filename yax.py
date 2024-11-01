@@ -1075,14 +1075,17 @@ def rewire_node(node: Expr, repl: Expr):
 
 
 def update_in_trees(parents: tuple[Mox, ...], ix: int, repl: Mox):
+    orig = parents[-1].children[ix]
+    arity = len(orig.inputs)
+    if isinstance(orig, Mox):
+        arity -= orig.var_tree.num_leaves
+
     if isinstance(repl, Equation):
         repl_inputs = repl.inputs
     elif isinstance(repl, Mox):
         repl_inputs = repl.inputs[repl.var_tree.num_leaves:]
-    orig = parents[-1].children[ix]
-    arity = len(orig.inputs)
     orig_syms, aux_syms = repl_inputs[:arity], repl_inputs[arity:]
-    if orig.inputs != orig_syms:
+    if orig.inputs[-arity:] != orig_syms:
         raise NotImplementedError(
             'Original input symbols must be preserved at the moment.')
 
@@ -1135,7 +1138,8 @@ def update_var_trees(parents: tuple[Mox, ...], ix: int, repl: Mox):
         p.inputs = inputs + p.inputs[num_params:]
 
         p.entrypoint = None  # Mark as an ephemeral.
-        orig_name = p.params.get('name')
+        if (parent_name := p.params.get('name')):
+            orig_name = parent_name  # Top-level module.
         repl = p
 
     # Restore child var-tree.
@@ -1150,8 +1154,7 @@ def update_var_trees(parents: tuple[Mox, ...], ix: int, repl: Mox):
     # Update in-place root params.
     if 'params' not in variables:
         variables['params'] = {}
-    if len(parents) == 1:
-        variables['params'].pop(orig_name, None)
+    variables['params'].pop(orig_name, None)
     assert repl_name not in variables['params'], \
         'Duplicated key in variables: fix name generation or fix a tree.'
     variables['params'].update(repl_vars['params'])
