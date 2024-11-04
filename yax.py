@@ -355,6 +355,10 @@ class MoxBuilder:
         """A hook to intercept call of `flax.linen.Module` method."""
         # TODO(@daskol): Should we run nested tracer?
         # TODO(@daskol): How to flatten in abstract way?
+        # TODO(@daskol): Do not ignore `setup` method.
+        if context.method_name == 'setup':
+            return fn(*args, **kwargs)
+
         # It is important to access `__dict__` directly since `__getattr__` is
         # overriden.
         params = {f.name: context.module.__dict__.get(f.name)

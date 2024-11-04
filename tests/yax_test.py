@@ -198,6 +198,51 @@ class TestResBlock:
         assert not subtree['ephemeral']
 
 
+class SetupModule(nn.Module):
+    def setup(self):
+        self.dense = nn.Dense(4)
+
+    def __call__(self, xs):
+        return self.dense(xs)
+
+
+class TestSetupModule:
+    """Test MoX in case of modules with explicit `setup` method.
+
+    At the moment, we assume that there is no useful in `setup`. Thus, we can
+    just ignore this method. Otherwise, we get in a situation when MoX contains
+    `setup` and `__call__` subsequently. This results in issue after
+    modification since `setup` is not change hierarchy while it binds to the
+    same variables/literals.
+    """
+
+    @pytest.fixture
+    @staticmethod
+    def state() -> Iterator[ModelState]:
+        batch = jnp.ones(4)
+        key = jax.random.PRNGKey(42)
+        model = SetupModule()
+        params = jax.jit(model.init)(key, batch)
+        yield ModelState(model, params, batch)
+
+    def test_make(self, state: ModelState):
+        mox = make_mox(state.model.apply)(state.params, state.batch)
+        assert isinstance(mox, Mox)
+        assert mox.is_ephemeral
+        assert len(mox.children) == 1
+
+        submox: Mox = mox.children[0]
+        assert not submox.is_ephemeral
+        assert len(submox.inputs) == 3
+        assert len(submox.outputs) == 1
+
+    def test_eval(self, state: ModelState):
+        mox = make_mox(state.model.apply)(state.params, state.batch)
+        actual = eval_mox(mox, state.params, state.batch)
+        desired = state.model.apply(state.params, state.batch)
+        assert_allclose(actual, desired)
+
+
 @pytest.mark.slow
 class TestHFModels:
 
