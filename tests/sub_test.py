@@ -43,6 +43,45 @@ class Identity(nn.Module):
         return jnp.array(xs)
 
 
+class AttentionModule(nn.Module):
+    inner_ty: Type[nn.Module] = nn.Dense
+    head_shape: tuple[int, ...] = (2, )
+    num_heads: int = 2
+
+    def split_heads(self, hs: jax.Array) -> jax.Array:
+        return hs.reshape(*hs.shape[:-2], self.num_heads, *self.head_shape)
+
+    @nn.compact
+    def __call__(self, xs):
+        ks = self.inner_ty(4, name='key')(xs)
+        ks = self.split_heads(ks)
+        qs = self.inner_ty(4, name='query')(xs)
+        qs = self.split_heads(qs)
+        return jnp.einsum('...hi,...hi->...h', ks, qs)
+
+
+@pytest.fixture
+def attn():
+    model = AttentionModule()
+    batch = jnp.ones((1, 4))
+    params = jax.jit(model.init)(jax.random.PRNGKey(42), batch)
+    mox = make_mox(model.apply)(params, batch)
+    modified_model = AttentionModule(inner_ty=Identity)
+    del model
+    yield ModelState(mox, modified_model, params, batch)
+
+
+@pytest.fixture
+def mlp():
+    model = nn.Sequential([nn.Dense(4), nn.relu, nn.Dense(2)])
+    batch = jnp.ones((1, 4))
+    params = jax.jit(model.init)(jax.random.PRNGKey(42), batch)
+    mox = make_mox(model.apply)(params, batch)
+    modified_model = nn.Sequential([nn.Dense(4), nn.gelu, nn.Dense(2)])
+    del model
+    yield ModelState(mox, modified_model, params, batch)
+
+
 class ResModule(nn.Module):
     features: int = 10
     inner_ty: Type[nn.Module] = nn.Dense
@@ -59,17 +98,6 @@ def res_block():
     params = jax.jit(model.init)(jax.random.PRNGKey(42), batch)
     mox = make_mox(model.apply)(params, batch)
     modified_model = ResModule(inner_ty=nn.Dense)
-    del model
-    yield ModelState(mox, modified_model, params, batch)
-
-
-@pytest.fixture
-def mlp():
-    model = nn.Sequential([nn.Dense(4), nn.relu, nn.Dense(2)])
-    batch = jnp.ones((1, 4))
-    params = jax.jit(model.init)(jax.random.PRNGKey(42), batch)
-    mox = make_mox(model.apply)(params, batch)
-    modified_model = nn.Sequential([nn.Dense(4), nn.gelu, nn.Dense(2)])
     del model
     yield ModelState(mox, modified_model, params, batch)
 
@@ -227,34 +255,73 @@ def test_sub_callable(mlp: ModelState):
     assert_allclose(actual, desired)
 
 
-def test_sub_equation(mlp: ModelState):
-    gelu_mox = make_mox(jax.jit(jax.nn.gelu))(mlp.batch)
-    gelu_expr = gelu_mox.children[0]
-    assert isinstance(gelu_expr, Equation)
-    mox = sub('//[@primitive="pjit"][@name="relu"]', gelu_expr, mlp.mox)
+class TestSub:
 
-    actual = eval_mox(mox, mlp.params, mlp.batch)
-    desired = mlp.model.apply(mlp.params, mlp.batch)
-    assert_allclose(actual, desired)
+    def test_equation(self, mlp: ModelState):
+        gelu_mox = make_mox(jax.jit(jax.nn.gelu))(mlp.batch)
+        gelu_expr = gelu_mox.children[0]
+        assert isinstance(gelu_expr, Equation)
+        mox = sub('//[@primitive="pjit"][@name="relu"]', gelu_expr, mlp.mox)
 
+        actual = eval_mox(mox, mlp.params, mlp.batch)
+        desired = mlp.model.apply(mlp.params, mlp.batch)
+        assert_allclose(actual, desired)
 
-def test_sub_mox(res_block: ModelState):
-    # TODO(@daskol): Bug in multiple predicates evaluation.
-    # nodes = query('//[@primitive="module_call"][@name="layers_0"]', mlp)
-    # assert len(nodes) == 1
-    module = nn.Dense(10)
-    # Firstly, param dictionary must be updated.
-    params = jax.jit(module.init)(jax.random.PRNGKey(3705), res_block.batch)
-    variables = {**res_block.params}
-    variables['params'] = {'Dense_0': params['params']}
-    # Secondly, module expression for substitution must be built.
-    inner_expr = make_mox(module.apply)(params, res_block.batch)
-    inner_mox = inner_expr.children[0]
-    assert isinstance(inner_mox, Mox)
-    # Thirdly, original MoX can be updated.
-    mox = sub('//[@primitive="module_call"][@name="Identity_0"]', inner_mox,
-              res_block.mox)
+    def test_mox(self, res_block: ModelState):
+        # TODO(@daskol): Bug in multiple predicates evaluation.
+        # nodes = query('//[@primitive="module_call"][@name="layers_0"]', mlp)
+        # assert len(nodes) == 1
+        module = nn.Dense(10)
+        # Firstly, param dictionary must be updated.
+        params = jax.jit(module.init)(jax.random.PRNGKey(42), res_block.batch)
+        variables = {**res_block.params}
+        variables['params'] = {'Dense_0': params['params']}
+        # Secondly, module expression for substitution must be built.
+        inner_expr = make_mox(module.apply)(params, res_block.batch)
+        inner_mox = inner_expr.children[0]
+        assert isinstance(inner_mox, Mox)
+        # Thirdly, original MoX can be updated.
+        mox = sub('//[@primitive="module_call"][@name="Identity_0"]',
+                  inner_mox, res_block.mox)
 
-    actual = eval_mox(mox, variables, res_block.batch)
-    desired = res_block.model.apply(variables, res_block.batch)
-    assert_allclose(actual, desired)
+        actual = eval_mox(mox, variables, res_block.batch)
+        desired = res_block.model.apply(variables, res_block.batch)
+        assert_allclose(actual, desired)
+
+    def test_inner_method(self, attn: ModelState):
+        """This test case is for situation when :py:func:`sub` changes
+        parameters of the current module (e.g. remove some parameters). The
+        issue is that these changes of state in `var_tree` of the current
+        `module_call` must be propagated to other `module_call` of the current
+        module with different entrypoint.
+
+        Other entrypoints of the current module does not necessery access
+        `var_tree` but `module_call` implies passing entire `var_tree` even if
+        it is not needed.
+        """
+        # 0. Verify XPath expression.
+        xpath = '//[@primitive="module_call"][@type="Dense"]'
+        res = query(xpath, attn.mox)
+        assert len(res) == 2, 'Too few `nn.Dense` modules selected.'
+
+        # 1. Prepare substitution.
+        def fn(path: tuple[str, ...], expr: Expr) -> Expr:
+            if not isinstance(expr, Mox):
+                return expr
+            module = nn.Dense(4, name=f'{path[-1]}_0')
+            module_params = module.init(jax.random.PRNGKey(42), attn.batch)
+            module_expr = make_mox(module.apply)(module_params, attn.batch)
+            module_mox = module_expr.children[0]
+            assert isinstance(module_mox, Mox)
+            return module_mox
+
+        # 3. Update original MoX.
+        mox = sub(xpath, fn, attn.mox)
+
+        params = attn.params
+        params['params']['key_0'] = params['params'].pop('key')
+        params['params']['query_0'] = params['params'].pop('query')
+
+        # 4. Apply new mox.
+        res = eval_mox(mox, params, attn.batch)
+        print(res)
