@@ -19,6 +19,7 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import pytest
+from jax.tree_util import PyTreeDef
 from numpy.testing import assert_allclose
 
 from yax import (
@@ -299,10 +300,13 @@ class TestSub:
         `var_tree` but `module_call` implies passing entire `var_tree` even if
         it is not needed.
         """
-        # 0. Verify XPath expression.
+        # 0a. Verify XPath expression.
         xpath = '//[@primitive="module_call"][@type="Dense"]'
         res = query(xpath, attn.mox)
         assert len(res) == 2, 'Too few `nn.Dense` modules selected.'
+
+        # 0b. Evaluate original MoX on test input.
+        desired = eval_mox(attn.mox, attn.params, attn.batch)
 
         # 1. Prepare substitution.
         def fn(path: tuple[str, ...], expr: Expr) -> Expr:
@@ -318,10 +322,20 @@ class TestSub:
         # 3. Update original MoX.
         mox = sub(xpath, fn, attn.mox)
 
+        var_tree: PyTreeDef = mox.children[0].var_tree
+        inner_var_tree: PyTreeDef = mox.children[0].children[1].var_tree
+        assert var_tree.num_leaves == inner_var_tree.num_leaves
+        vars_ = mox.children[0].inputs[:var_tree.num_leaves]
+        inner_vars = mox.children[0].children[1].inputs[:var_tree.num_leaves]
+        assert vars_[0] == inner_vars[0]
+        assert vars_ == inner_vars
+
+        # 4. We replace `nn.Dense(4)` with `nn.Dense(4)` thus architcture is
+        #    intact but parameter tree changes.
         params = attn.params
         params['params']['key_0'] = params['params'].pop('key')
         params['params']['query_0'] = params['params'].pop('query')
 
-        # 4. Apply new mox.
-        res = eval_mox(mox, params, attn.batch)
-        print(res)
+        # 5. Evaluate new MoX (result must be the same).
+        actual = eval_mox(mox, params, attn.batch)
+        assert_allclose(desired, actual)

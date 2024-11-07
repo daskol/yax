@@ -1138,8 +1138,23 @@ def update_var_trees(parents: tuple[Mox, ...], ix: int, repl: Mox):
         assert repl_name not in variables['params'], \
             'Duplicated key in variables: fix name generation or fix a tree.'
         variables['params'][repl_name] = repl_vars.get('params', {})
+        var_tree = p.var_tree
         inputs, p.var_tree = jax.tree.flatten(variables)
         p.inputs = inputs + p.inputs[num_params:]
+
+        # Check whether `expr` shares the same `var_tree`, i.e. other
+        # entrypoint of the same module. If it is the same module then we must
+        # ensure that its `var_tree` is the same.
+        #
+        # TODO(@daskol): Propagate `var_tree` changees down to leaves.
+        for child in p.children:
+            if child is repl:
+                continue
+            if not isinstance(child, Mox) or child.var_tree != var_tree:
+                continue
+            child.inputs = p.inputs[:p.var_tree.num_leaves] \
+                        + child.inputs[child.var_tree.num_leaves:]
+            child.var_tree = p.var_tree
 
         p.entrypoint = None  # Mark as an ephemeral.
         if (parent_name := p.params.get('name')):
