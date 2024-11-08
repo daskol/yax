@@ -24,7 +24,7 @@ from jax import Array
 from jax.extend.core import ClosedJaxpr, primitives
 from numpy.testing import assert_allclose
 
-from yax import Equation, Mox, eval_mox, make_mox
+from yax import Equation, Expr, Mox, eval_mox, make_mox, map_mox
 
 
 @pytest.mark.parametrize('fn', [
@@ -117,6 +117,54 @@ class TestBinaryModule:
         mtree = make_mox(fn)(xs, ys)
         actual = eval_mox(mtree, xs, ys)
         desired = fn(xs, ys)
+        assert_allclose(actual, desired)
+
+
+class IdentityModule(nn.Module):
+    @nn.compact
+    def __call__(self, xs):
+        return xs
+
+
+class TestIdentityModule:
+
+    @pytest.fixture
+    @staticmethod
+    def state() -> Iterator[ModelState]:
+        key = jax.random.PRNGKey(42)
+        batch = jnp.ones(4)
+        model = IdentityModule()
+        params = model.init(key, batch)
+        yield ModelState(model, params, batch)
+
+    def test_make(self, state: ModelState):
+        mtree = make_mox(state.model.apply)(state.params, state.batch)
+        assert isinstance(mtree, Mox)
+        assert mtree.is_ephemeral
+        assert len(mtree.children) == 1
+
+        subtree: Mox = mtree.children[0]
+        assert not subtree.is_ephemeral
+        assert len(subtree.inputs) == 1
+        assert len(subtree.outputs) == 1
+        assert subtree.inputs == subtree.outputs
+
+    @pytest.mark.parametrize('ephemeral', [False, True])
+    def test_eval(self, state: ModelState, ephemeral: bool):
+        mox = make_mox(state.model.apply)(state.params, state.batch)
+
+        def erase_type(expr: Expr) -> Expr:
+            if isinstance(expr, Mox):
+                mox: Mox = expr
+                mox.module_ty = None  # Convert to ephemeral.
+                assert mox.is_ephemeral, 'Module is not ephemeral.'
+            return expr
+
+        if ephemeral:
+            map_mox(erase_type, mox)
+
+        actual = eval_mox(mox, state.params, state.batch)
+        desired = state.model.apply(state.params, state.batch)
         assert_allclose(actual, desired)
 
 

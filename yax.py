@@ -875,6 +875,10 @@ def eval_module(read, write, mox: Mox):
         if isinstance(var, Symbol):
             return read(var)
 
+    def write_safe(var: Symbol, val: Any):
+        if var not in mox.inputs:
+            write(var, val)
+
     # Weight and input symbol are all flattened and stored in single list. In
     # order to apply module func to weights and inputs we need to separate
     # them, restore weights, and restore inputs.
@@ -898,7 +902,7 @@ def eval_module(read, write, mox: Mox):
     outputs, out_tree = jax.tree.flatten(out_vals)
     assert out_tree == mox.out_tree, \
         f'Output tree mismatched in eval time: {mox.out_tree} -> {out_tree}.'
-    jax.tree.map(write, mox.outputs, outputs)
+    jax.tree.map(write_safe, mox.outputs, outputs)
 
 
 def eval_equation(read, write, eq: Equation):
