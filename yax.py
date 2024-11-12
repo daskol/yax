@@ -178,7 +178,7 @@ def _lower(builder: 'MoxBuilder', main: MainTrace, *ins):
 
 @lu.transformation
 def _raise(builder, *ins):
-    with new_main(ModuleTrace, builder=builder) as main:
+    with new_main(ModuleTrace, True, builder=builder) as main:
         outs = yield (main, *ins), {}
         del main
     yield outs

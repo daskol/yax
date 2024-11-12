@@ -31,6 +31,13 @@ def assert_empty(mox):
     assert mox.children == []
 
 
+def assert_non_empty(mox):
+    __tracebackhide__ = True  # Hide traceback for py.test
+    assert isinstance(mox, Mox)
+    assert mox.is_ephemeral
+    assert mox.children != []
+
+
 def assert_output_types(mox: Mox, types: Type[Symbol]):
     __tracebackhide__ = True  # Hide traceback for py.test
     assert len(mox.outputs) == len(types)
@@ -62,9 +69,9 @@ def test_pure_consts():
         return jnp.ones((3, 2))
 
     mox = make_mox(fn)()
-    assert_empty(mox)
+    assert_non_empty(mox)
     assert len(mox.inputs) == 0
-    assert_output_types(mox, (Literal, ))
+    assert_output_types(mox, (Var, ))
 
     const = jnp.ones((3, 2))
     assert_allclose(eval_mox(mox), const)
@@ -76,7 +83,7 @@ def test_pure_mixed():
 
     mox = make_mox(fn)(jnp.ones((2, 3)))
     assert len(mox.inputs) == 1
-    assert_output_types(mox, (Var, Literal))
+    assert_output_types(mox, (Var, Var))
 
     value = jnp.ones((2, 3))
     const = jnp.ones((3, 2))
