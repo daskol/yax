@@ -34,7 +34,9 @@ import jax
 import jax.extend as jex
 import jax.extend.linear_util as lu
 import jax.numpy as jnp
+from flax.core.scope import LazyRng
 from flax.linen.module import Callable, InterceptorContext, intercept_methods
+from flax.typing import RNGSequences
 from jax.core import (
     AbstractValue, ClosedJaxpr as Jaxpr, ConcreteArray, MainTrace, ShapedArray,
     Sublevel, Trace, Tracer, find_top_trace, new_main)
@@ -261,6 +263,7 @@ class Mox(Expr):
     in_tree: PyTreeDef = field(default_factory=default_treedef)
     out_tree: PyTreeDef = field(default_factory=default_treedef)
     var_tree: PyTreeDef = field(default_factory=default_treedef)
+    rngs: RNGSequences = field(default_factory=dict)
 
     @property
     def is_ephemeral(self) -> bool:
@@ -364,10 +367,14 @@ class MoxBuilder:
         params = {f.name: context.module.__dict__.get(f.name)
                   for f in fields(context.module) if f.name != 'parent'}
         module_info = type(context.module), context.method_name
+        module_rngs = {}
+        for name, rng in context.module.scope.rngs.items():
+            [rng_sym] = self.to_symbols([rng.rng])
+            module_rngs[name] = LazyRng(rng_sym, rng.suffix)
 
         # Push on stack partially built module expression object. It will be
         # finalized by the end of this routine.
-        child = Mox([], [], params, [], *module_info)
+        child = Mox([], [], params, [], *module_info, rngs=module_rngs)
         parent = self.block_stack[-1]
         parent.children += [child]
         self.block_stack += [child]
@@ -886,7 +893,18 @@ def eval_module(read, write, mox: Mox):
     var_syms = jax.tree.unflatten(mox.var_tree, mox.inputs[:num_vars])
     var_vals = jax.tree.map(read, var_syms)
 
+    # Materialize RNGs states.
+    rngs = {}
+    rng_counters = {}
+    for name, rng in mox.rngs.items():
+        rngs[name] = LazyRng(rng=read_safe(rng.rng), suffix=rng.suffix)
+        rng_counters[name] = 0
+
     with flax.core.bind(var_vals).temporary() as scope:
+        # Ad hoc patching of RNG states in scope.
+        scope.rngs = rngs
+        scope.rng_counters = rng_counters
+
         mod = mox.module_ty(**mox.params)
         scoped_mod = mod.clone(parent=scope)
 

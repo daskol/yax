@@ -168,6 +168,52 @@ class TestIdentityModule:
         assert_allclose(actual, desired)
 
 
+class RNGModuleInner(nn.Module):
+    @nn.compact
+    def __call__(self):
+        xs = self.make_rng('rng_stream')
+        ys = self.make_rng('rng_stream')
+        return xs, ys
+
+
+class RNGModule(nn.Module):
+    @nn.compact
+    def __call__(self):
+        xs, ys = RNGModuleInner()()
+        zs = self.make_rng('rng_stream')
+        return xs, ys, zs
+
+
+class TestRNGModule:
+
+    @pytest.fixture
+    @staticmethod
+    def state() -> Iterator[ModelState]:
+        key = jax.random.key(42)
+        model = RNGModule()
+        params = model.init(key)
+        yield ModelState(model, params, jnp.empty(()))
+
+    def test_make(self, state: ModelState):
+        rngs = {'rng_stream': jax.random.key(42)}
+        expr = make_mox(state.model.apply)(state.params, rngs=rngs)
+        assert isinstance(expr, Mox)
+        assert expr.is_ephemeral
+        assert len(expr.children) == 1
+
+        mox: Mox = expr.children[0]
+        assert not mox.is_ephemeral
+        assert len(mox.inputs) == 0
+        assert len(mox.outputs) == 2
+
+    def test_eval(self, state: ModelState):
+        rngs = {'rng_stream': jax.random.key(42)}
+        mox = make_mox(state.model.apply)(state.params, rngs=rngs)
+        actual = eval_mox(mox, state.params, rngs=rngs)
+        desired = state.model.apply(state.params, rngs=rngs)
+        assert actual == [*desired]
+
+
 class TestStatefulModule:
 
     @pytest.fixture
