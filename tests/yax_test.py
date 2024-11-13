@@ -204,7 +204,7 @@ class TestRNGModule:
         mox: Mox = expr.children[0]
         assert not mox.is_ephemeral
         assert len(mox.inputs) == 0
-        assert len(mox.outputs) == 2
+        assert len(mox.outputs) == 3
 
     def test_eval(self, state: ModelState):
         rngs = {'rng_stream': jax.random.key(42)}
