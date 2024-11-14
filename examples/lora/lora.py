@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Module `lora` implements LoRA-adapter itself and routines to patch model
+with LoRA-adapters and roll them back.
+"""
 
 from functools import reduce, wraps
 from itertools import count
@@ -40,7 +43,7 @@ class LoRA(nn.Module):
     """Low-Rank Adaptation (LoRA) module that applies a low-rank correction to
     the original :py:class:`flax.linen.Dense` module.
 
-    [1]: https://arxiv.org/abs/2309.15223
+    [1]: https://openreview.net/forum?id=nZeVKeeFYf9
     """
 
     features: int
