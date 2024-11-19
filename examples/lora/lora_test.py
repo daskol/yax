@@ -2,10 +2,10 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import pytest
-from lora import Params, lora
 from numpy.testing import assert_allclose
 from transformers import FlaxRobertaForSequenceClassification as RoBERTa
 
+from lora import Params, lora
 from yax import eval_mox, make_mox, query
 
 
