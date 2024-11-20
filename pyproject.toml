@@ -42,7 +42,9 @@ Repository = "https://github.com/daskol/yax.git"
 
 [tool.isort]
 combine_as_imports = true
-known_first_party = ["_fewbit", "fewbit", "lora", "yax"]
+known_first_party = [
+    "_fewbit", "fewbit", "lora", "profile_pb2", "profiling", "yax",
+]
 multi_line_output = 4
 
 [tool.mypy]

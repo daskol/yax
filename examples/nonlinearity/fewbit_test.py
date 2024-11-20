@@ -20,6 +20,7 @@ import scipy.special
 from numpy.testing import assert_allclose, assert_equal
 
 from fewbit import BOUNDARIES, LEVELS, gelu, gelu_fwd, grandient_quantized_bwd
+from profiling import memory_usage
 
 
 class TestGrandientQuantizedBwd:
@@ -85,3 +86,18 @@ class TestGELU:
         desired = gelu(xs, BOUNDARIES, LEVELS)
         actual, _ = jax.jit(gelu_vjp)(xs, BOUNDARIES, LEVELS)
         assert_allclose(actual, desired)  # TODO(@daskol): Assert grads.
+
+
+def test_memory_usage():
+    key = jax.random.key(42)
+    primals = jax.random.normal(key, (64 * 1024, ))
+    tangents = jnp.ones_like(primals)
+
+    @jax.grad
+    def fn(xs):
+        return gelu(xs, BOUNDARIES, LEVELS).mean()
+
+    with memory_usage() as span:
+        tangents = fn(primals)
+        tangents.block_until_ready()
+    assert 0 <= span.change < 2 * primals.size
