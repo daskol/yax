@@ -101,3 +101,14 @@ def test_memory_usage():
         tangents = fn(primals)
         tangents.block_until_ready()
     assert 0 <= span.change < 2 * primals.size
+
+    lowered = jax.jit(fn).lower(primals)
+    compiled = lowered.compile()
+    mem = compiled.memory_analysis()
+    aux_usage = mem.temp_size_in_bytes  # Internal buffers.
+    total_usage = mem.argument_size_in_bytes \
+                + mem.temp_size_in_bytes \
+                + mem.output_size_in_bytes
+    numel = primals.size
+    assert aux_usage <= 4 * numel + 3 * numel / 8 + 64
+    assert total_usage <= 3 * 4 * numel + 3 * numel / 8 + 64
