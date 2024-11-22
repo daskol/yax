@@ -29,7 +29,7 @@ from jax.tree_util import DictKey, tree_map_with_path
 
 from yax import Expr, Mox, XPath, make_mox, sub
 
-__all__ = ('LoRA', 'Mask', 'MergeFn', 'Params', 'lora')
+__all__ = ('LoRA', 'Mask', 'MergeFn', 'Params', 'lora', 'mask_by_prefix')
 
 KeyArray: TypeAlias = jax.Array
 
@@ -228,3 +228,19 @@ def update_subcol(where: Params, what: Sequence[str], name: str, repl: Params,
         parent[name] = repl[collection]
     else:
         where[collection] = repl[collection]
+
+
+def mask_by_prefix(prefix: Sequence[str], params: Params) -> Mask:
+    """Make a mask tree for a weights tree `params` by prefix `prefix`.
+
+    >>> leaf = jnp.empty(())
+    >>> mask_by_prefix(('a', ), {'a': {'x': leaf}, 'b': {'y': leaf}})
+    {'a': {'x': True}, 'b': {'y': False}}
+    """
+    prefix = tuple(prefix)
+
+    def fn(key_path: tuple[DictKey, ...], _):
+        key = tuple([x.key for x in key_path])
+        return key[:len(prefix)] == prefix
+
+    return tree_map_with_path(fn, params)

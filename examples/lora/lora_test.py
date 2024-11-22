@@ -1,3 +1,5 @@
+from operator import add
+
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
@@ -5,7 +7,7 @@ import pytest
 from numpy.testing import assert_allclose
 from transformers import FlaxRobertaForSequenceClassification as RoBERTa
 
-from lora import Params, lora
+from lora import Params, lora, mask_by_prefix
 from yax import eval_mox, make_mox, query
 
 
@@ -107,3 +109,31 @@ def test_roberta():
     for actual, desired in zip(flat_params_merged, flat_params):
         assert_allclose(actual, desired)
     _ = apply_fn(params, input_ids, key)
+
+
+def test_mask_dummy():
+    leaf = jnp.empty(())
+    mask = mask_by_prefix(('a', ), {'a': {'x': leaf}, 'b': {'y': leaf}})
+    assert mask == {'a': {'x': True}, 'b': {'y': False}}
+    assert jax.tree.reduce(add, mask) == 1
+
+
+def test_mask_simple():
+    params = {
+        'params': {
+            'roberta': {
+                'Dense_0': {
+                    'kernel': jnp.empty((2, 2)),
+                    'bias': jnp.empty((2, )),
+                }
+            },
+            'classifier': {
+                'Dense_1': {
+                    'kernel': jnp.empty((2, 2)),
+                    'bias': jnp.empty((2, )),
+                }
+            }
+        }
+    }
+    mask = mask_by_prefix(['params', 'classifier'], params)
+    assert jax.tree.reduce(add, mask) == 2
