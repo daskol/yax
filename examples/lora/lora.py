@@ -18,25 +18,29 @@ with LoRA-adapters and roll them back.
 from functools import reduce, wraps
 from itertools import count
 from time import monotonic
-from typing import Any, Callable, Sequence, TypeAlias
+from typing import Any, Callable, Sequence, TypeAlias, Union
 
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
 from flax.linen.initializers import lecun_normal, zeros_init
 from flax.typing import Dtype, Initializer, PrecisionLike
+from jax.tree_util import DictKey, tree_map_with_path
 
 from yax import Expr, Mox, XPath, make_mox, sub
 
-__all__ = ('LoRA', 'MergeFn', 'Params', 'lora')
+__all__ = ('LoRA', 'Mask', 'MergeFn', 'Params', 'lora')
 
 KeyArray: TypeAlias = jax.Array
 
-XPathLike: TypeAlias = XPath | str
+# TODO(@daskol): `type` statement.
+Mask: TypeAlias = dict[str, Union['Mask', bool]]
 
 Params: TypeAlias = dict[str, Any]
 
 MergeFn = Callable[[Params], Params]
+
+XPathLike: TypeAlias = XPath | str
 
 
 class LoRA(nn.Module):
@@ -84,7 +88,7 @@ class LoRA(nn.Module):
 
 def lora(key: KeyArray, xpath: XPathLike, mox: Mox, params: Params,
          rank: int = 2, alpha: float = 1.0, instrument: bool = False,
-         **kwargs) -> tuple[Mox, Params, MergeFn]:
+         **kwargs) -> tuple[Mox, Params, Mask, MergeFn]:
     """Apply LoRA-adapter modules specified by `xpath` in `mox` with `rank`."""
     lora_ix = (f'LoRA_{ix}' for ix in count())  # Name LoRA-adapters.
     param_bl = ('dot_general', 'dot_general_cls', 'features', 'name')
@@ -146,6 +150,19 @@ def lora(key: KeyArray, xpath: XPathLike, mox: Mox, params: Params,
         sub_fn = instrument(sub_fn)
     mox = sub(xpath, sub_fn, mox)
 
+    def predicate(key_path: tuple[DictKey, ...], _) -> bool:
+        # TODO(@daskol): Inefficient: too many iterations.
+        key = tuple([x.key for x in key_path[1:]])
+        if key[-1] not in ('lhs', 'rhs'):
+            return False
+        for path in lora_paths:
+            if key[:-1] == path[:-1]:
+                return True
+        else:
+            return False
+
+    mask = tree_map_with_path(predicate, lora_params)
+
     def merge(params: Params) -> Params:
         """Merge LoRA factors back to frozen weights and restore original
         weight tree.
@@ -167,7 +184,7 @@ def lora(key: KeyArray, xpath: XPathLike, mox: Mox, params: Params,
             del_subcol(params, path[:-1])
         return params
 
-    return mox, lora_params, merge
+    return mox, lora_params, mask, merge
 
 
 def elapsed(fn):

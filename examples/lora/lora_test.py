@@ -33,12 +33,13 @@ def test_simple():
 
     # 3. Apply LoRA transformation and build an application function for
     #    LoRAfied model.
-    lora_mox, lora_params, merge = lora(subkey, xpath, mox, params, rank=2,
-                                        alpha=10)
+    lora_mox, lora_params, mask, merge = \
+        lora(subkey, xpath, mox, params, rank=2, alpha=10)
     assert 'LoRA_0' in lora_params['params']
     dense = params['params']['Dense_0']
     dense_frozen = lora_params['params']['LoRA_0'].get('Dense_0')
     assert dense == dense_frozen
+    assert jax.tree.reduce(lambda x, y: x + y, mask) == 2
 
     @jax.jit
     def apply_lora(params: Params, *inputs):
@@ -88,8 +89,9 @@ def test_roberta():
     # 3. Apply LoRA transformation and build an application function for
     #    LoRAfied model.
     key = jax.random.PRNGKey(42)
-    mox_lora, params_lora, merge = lora(key, xpath, mox, params, rank=2,
-                                        alpha=10)
+    mox_lora, params_lora, mask, merge = \
+        lora(key, xpath, mox, params, rank=2, alpha=10)
+    assert jax.tree.reduce(lambda x, y: x + y, mask) == 2 * len(nodes)
 
     def apply_lora(params: Params, input_ids: jax.Array, dropout_rng):
         return eval_mox(mox_lora, params, input_ids, dropout_rng)
