@@ -1,0 +1,8 @@
+*.egg-info
+.*
+Dockerfile
+Makefile
+build
+dist
+examples
+notebooks

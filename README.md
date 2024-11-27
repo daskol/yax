@@ -205,3 +205,9 @@ Substitution requires the preservation of some invariants.
   ```
 - Compositionality with `jax.scan`, `jax.vmap`, and `jax.pmap` is not verified.
 - Pretty printing of module expressions is not available for now.
+
+# Container
+
+```shell
+docker pull ghcr.io/daskol/yax
+```
