@@ -7,7 +7,7 @@ import pytest
 from numpy.testing import assert_allclose
 from transformers import FlaxRobertaForSequenceClassification as RoBERTa
 
-from lora import Params, lora, mask_by_prefix
+from lora import Params, lora, mask_by_prefix, merge, split
 from yax import eval_mox, make_mox, query
 
 
@@ -137,3 +137,21 @@ def test_mask_simple():
     }
     mask = mask_by_prefix(['params', 'classifier'], params)
     assert jax.tree.reduce(add, mask) == 2
+
+
+def test_split_merge():
+    leaf = jnp.empty(())
+    mask = {'a': {'x': True}, 'b': {'y': False}}
+    tree = {'a': {'x': leaf}, 'b': {'y': leaf}}
+
+    def nnz(tree):
+        return jax.tree.reduce(
+            lambda y, z: y + (z is None),
+            tree, 0, is_leaf=lambda x: x is None)
+
+    lhs, rhs = split(mask, tree)
+    assert nnz(lhs) == 1
+    assert nnz(rhs) == 1
+
+    res = merge(lhs, rhs)
+    assert res == tree

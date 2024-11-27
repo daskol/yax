@@ -29,7 +29,8 @@ from jax.tree_util import DictKey, tree_map_with_path
 
 from yax import Expr, Mox, XPath, make_mox, sub
 
-__all__ = ('LoRA', 'Mask', 'MergeFn', 'Params', 'lora', 'mask_by_prefix')
+__all__ = ('LoRA', 'Mask', 'MergeFn', 'Params', 'lora', 'mask_by_prefix',
+           'merge', 'split')
 
 KeyArray: TypeAlias = jax.Array
 
@@ -244,3 +245,34 @@ def mask_by_prefix(prefix: Sequence[str], params: Params) -> Mask:
         return key[:len(prefix)] == prefix
 
     return tree_map_with_path(fn, params)
+
+
+def split(pred: Mask | Callable[..., Any],
+          params: Params) -> tuple[Params, Params]:
+    """Split a tree `params` on two according to mask `pred`.
+
+    >>> tree = {'a': {'x': 0}, 'b': {'y': 0}}
+    >>> mask = {'a': {'x': True}, 'b': {'y': False}}
+    >>> lhs, rhs = split(mask, tree)
+    >>> lhs
+    {'a': {'x': 0}, 'b': {'y': None}}
+    >>> rhs
+    {'a': {'x': None}, 'b': {'y': 1}}
+    """
+    if callable(pred):
+        mask: Mask = jax.tree.map(pred, params)
+        return split(mask, params)
+    lhs = jax.tree.map(lambda m, p: p if m else None, pred, params)
+    rhs = jax.tree.map(lambda m, p: None if m else p, pred, params)
+    return lhs, rhs
+
+
+def merge(ps: Params, qs: Params):
+    """Merge two trees of the same structure.
+
+    >>> tree = {'a': {'x': 0}, 'b': {'y': 0}}
+    >>> mask = {'a': {'x': True}, 'b': {'y': False}}
+    >>> tree == merge(*split(mask, tree))
+    """
+    return jax.tree.map(lambda x, y: x if y is None else y, ps, qs,
+                        is_leaf=lambda x: x is None)
