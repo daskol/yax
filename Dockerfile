@@ -14,6 +14,8 @@
 
 FROM nvidia/cuda:12.6.2-cudnn-devel-ubuntu24.04 AS base
 
+LABEL org.opencontainers.image.source="https://github.com/daskol/yax"
+
 RUN --mount=type=cache,target=/var/cache/apt \
     apt update -y && \
     apt install -y --no-install-recommends \
