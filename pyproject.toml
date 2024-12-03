@@ -32,7 +32,7 @@ dependencies = ["flax", "jax", "numpy"]
 requires-python = ">=3.12,<4"
 
 [project.optional-dependencies]
-dev = ["isort", "pytest>=8.2", "ruff"]
+dev = ["isort", "pytest>=8.2", "pytest-timeout~=2.3", "ruff"]
 serde = ["ytsaurus-client"]
 test = ["transformers"]
 

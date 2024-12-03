@@ -109,7 +109,7 @@ jobs:
           python -m pip install flax jax numpy
           # Testing dependencies.
           python -m pip install \
-            mypy pytest pytest-cov pytest-dirty transformers
+            mypy pytest pytest-cov pytest-dirty pytest-timeout transformers
       - name: Run all tests with PyTest
         run: |
           export PYTHON_TAG=$(

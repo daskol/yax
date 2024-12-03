@@ -61,6 +61,16 @@ def test_parse_xpath(value: str):
     assert str(xpath)
 
 
+@pytest.mark.xfail(reason='broken XPath')
+@pytest.mark.timeout(1.4142)
+@pytest.mark.parametrize('value', [
+    '//.[@name="query"] | //.[@name="key"]',
+])
+def test_parse_xpath_adhoc(value: str):
+    xpath = XPath(value)
+    assert str(xpath)
+
+
 class TestQuery:
 
     def test_query_root(self, mox: Mox):

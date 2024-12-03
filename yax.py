@@ -987,7 +987,8 @@ ModulePath: TypeAlias = tuple[str, ...]
 SubFn: TypeAlias = Callable[[ModulePath, Expr], Expr]
 
 
-def sub(expr: str | XPath, repl: Mox | Equation | SubFn, mox: Mox) -> Mox:
+def sub(expr: str | XPath | Sequence[Equation | Mox],
+        repl: Mox | Equation | SubFn, mox: Mox) -> Mox:
     """Substitute a module expression `mox` with `repl` according to matching
     pattern `expr`.
 
@@ -1021,11 +1022,14 @@ def sub(expr: str | XPath, repl: Mox | Equation | SubFn, mox: Mox) -> Mox:
     # Our substitution algorithm is quite straight forward: find nodes of
     # interest, verify type integrity, search parents, and finally replace.
     nodes: list[Equation | Mox] = []
-    for node in query(expr, mox):
-        if not isinstance(node, Equation | Mox):
-            raise RuntimeError(
-                f'XPath expression does not select a node: {expr}.')
-        nodes += [node]
+    if isinstance(expr, list | tuple):
+        nodes.extend(expr)
+    else:
+        for node in query(expr, mox):
+            if not isinstance(node, Equation | Mox):
+                raise RuntimeError(
+                    f'XPath expression does not select a node: {expr}.')
+            nodes += [node]
 
     for node in nodes:
         if not (parents := find_parents(mox, node)):
