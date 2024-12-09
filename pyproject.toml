@@ -28,7 +28,7 @@ classifiers = [
     "Topic :: Scientific/Engineering",
     "Typing :: Typed",
 ]
-dependencies = ["flax", "jax", "numpy"]
+dependencies = ["flax", "jax<0.4.36", "numpy"]
 requires-python = ">=3.12,<4"
 
 [project.optional-dependencies]

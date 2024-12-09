@@ -26,7 +26,7 @@ RUN --mount=type=cache,target=/var/cache/apt \
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --break-system-packages -U flax 'jax[cuda12]' numpy
+    pip install --break-system-packages -U flax 'jax[cuda12]<0.4.36' numpy
 
 FROM base AS dev
 

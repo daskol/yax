@@ -106,7 +106,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           # Mandatory dependencies.
-          python -m pip install flax jax numpy
+          python -m pip install flax 'jax<0.4.36' numpy
           # Testing dependencies.
           python -m pip install \
             mypy pytest pytest-cov pytest-dirty pytest-timeout transformers
