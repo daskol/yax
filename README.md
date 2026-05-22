@@ -108,7 +108,7 @@ functions with GELU or substitute all `nn.Dense` layers with LoRA adapters.
 ```python
 # Replace ReLU with GELU
 gelu_mox = yax.make_mox(nn.gelu)(inputs)
-modified_mox = yax.sub('//pjit[@name="relu"]', gelu_mox, mox)
+modified_mox = yax.sub('//jit[@name="relu"]', gelu_mox, mox)
 
 # Apply LoRA-adapters to all fully-connected layers.
 lora_mox = yax.make_mox(lora.apply)(params, inputs)
@@ -135,12 +135,12 @@ XML is actually a good and even appropriate serialization format.
     <input type="fp32[10]">c</input>
     <output type="fp32[10,10]">d</output>
   </dot_general>
-  <pjit
+  <jit
     jaxpr="{ lambda ; a:f32[10], b:f32[10]. let c:f32[10] = add a b in (c,) }">
     <input type="fp32[10]">d</input>
     <input type="fp32[10]">a</input>
     <output type="fp32[10]">e</output>
-  </pjit>
+  </jit>
   <outputs type="fp32[10]">e</outputs>
 </module_call>
 ```
@@ -161,7 +161,7 @@ XML.
    dimension_numbers="[[[0], [0]], [[], []]]";
    inputs={с="fp32[10]"; b="fp32[10,10]};
    outputs={d="fp32[10]"}>#;
-  <primitive="pjit";
+  <primitive="jit";
    inputs={d="fp32[10]"; a="fp32[10]"};
    outputs={e="fp32[10]"};
    jaxpr="{ lambda ; a:f32[10], b:f32[10]. let c:f32[10] = add a b in (c,) }";
