@@ -34,6 +34,7 @@ import jax
 import jax.extend as jex
 import jax.extend.linear_util as lu
 import jax.numpy as jnp
+import numpy as np
 from flax.core.scope import LazyRng
 from flax.linen.module import Callable, InterceptorContext, intercept_methods
 from flax.typing import RNGSequences
@@ -178,17 +179,30 @@ class ModuleTrace(Trace[ModuleTracer]):
             return fun.call_wrapped(*tracers)
 
 
+def _is_static_input(val) -> bool:
+    return (
+        not isinstance(val, AbstractValue | Tracer)
+        and isinstance(val, bool | np.bool_)
+    )
+
+
 @lu.transformation
 def _trace(builder: 'MoxBuilder', *ins):
     trace = ModuleTrace(builder=builder)
 
     with set_current_trace(trace, True):
         # NOTE We manually abstractify up to ShapedArray all input arguments.
-        in_tracers = [
-            trace.pure(jax.api_util.shaped_abstractify(x)) for x in ins
-        ]
+        in_tracers, call_args = [], []
+        for x in ins:
+            if _is_static_input(x):
+                in_tracers.append(trace.literal(x))
+                call_args.append(x)
+            else:
+                in_tracers.append(
+                    trace.pure(jax.api_util.shaped_abstractify(x)))
+                call_args.append(in_tracers[-1])
         builder.set_inputs(in_tracers)
-        outs = yield in_tracers, {}
+        outs = yield call_args, {}
 
         # TODO(@daskol): We do not use output tracers. Should we remove them?
         # This issue is related to the proper implementation of (sub)lifting
@@ -417,14 +431,18 @@ class MoxBuilder:
         args = (context.module, ) + args
         (scope, *in_args), child.in_tree = jax.tree.flatten((args, kwargs))
         trace = find_top_trace(flat_vars + in_args)  # TODO(@daskol): Dynamic!
-        in_tracers = [trace.full_raise(a) for a in in_args]
+        in_tracers, call_args = [], []
+        for arg in in_args:
+            tracer = trace.full_raise(arg)
+            in_tracers.append(tracer)
+            call_args.append(arg if _is_static_input(arg) else tracer)
         child.inputs.extend(self.to_symbols(in_tracers))  # XXX
 
         # Flatten function (inputs and outputs) for building intermediate
         # representation.
         wrap_fn = lu.wrap_init(unbound_fn)
         flat_fn, out_tree_fn = jax.api_util.flatten_fun(wrap_fn, child.in_tree)
-        outs = flat_fn.call_wrapped(scope, *in_tracers)
+        outs = flat_fn.call_wrapped(scope, *call_args)
 
         # TODO(@daskol): Remove code duplication with `_lower`.
         flat_outs, _ = jax.tree.flatten(outs)
