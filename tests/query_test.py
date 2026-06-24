@@ -24,9 +24,9 @@ from yax import Equation, Expr, Mox, XPath, make_mox, query, tokenize_xpath
 with_xpaths = pytest.mark.parametrize('value', [
     '/',
     '//',
-    '//pjit',
+    '//jit',
     '//[@primitive="module_call"]',
-    '//[@primitive="pjit"][@name="relu"]',
+    '//[@primitive="jit"][@name="relu"]',
     '//[@name="Dense_0"][@features=10]',
     '//[@name="ResBlock"]//[@features=10]',
     './module_call/..//[@type="Dense"][@features=10]',
@@ -86,7 +86,7 @@ class TestQuery:
         assert nodes[0] is mox
 
     @pytest.mark.parametrize('value,type_', [
-        pytest.param('//pjit', Equation, id='jaxpr'),
+        pytest.param('//jit', Equation, id='jaxpr'),
         pytest.param('//module_call', Mox, id='mox'),
     ])
     def test_query_by_name(self, mox: Mox, value: str, type_: Type[Expr]):
