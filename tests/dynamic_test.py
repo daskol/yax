@@ -18,7 +18,7 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import pytest
-from jax.core import ConcreteArray, ShapedArray
+from jax.core import AbstractValue, ShapedArray
 from numpy.testing import assert_allclose
 
 from yax import Literal, Mox, Symbol, Var, eval_mox, make_mox
@@ -44,7 +44,8 @@ def assert_output_types(mox: Mox, types: Type[Symbol]):
     for output, type_ in zip(mox.outputs, types):
         assert isinstance(output, type_)
         if type_ is Literal:
-            assert isinstance(output.value, ConcreteArray)
+            assert not isinstance(output.value, AbstractValue)
+            assert isinstance(output.aval, ShapedArray)
         elif type_ is Var:
             assert isinstance(output.value, ShapedArray)
         else:
@@ -91,6 +92,20 @@ def test_pure_mixed():
     assert len(actual) == 2
     assert_allclose(actual[0], value)
     assert_allclose(actual[1], const)
+
+
+def test_mixed_literal_input():
+    def fn(xs) -> jax.Array:
+        return xs > 0
+
+    value = jnp.array([-1, 1])
+    mox = make_mox(fn)(value)
+
+    assert any(
+        isinstance(sym, Literal)
+        for child in mox.children
+        for sym in child.inputs)
+    assert_allclose(eval_mox(mox, value), fn(value))
 
 
 class InputLiteralModel(nn.Module):

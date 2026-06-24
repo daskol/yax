@@ -34,12 +34,13 @@ import jax
 import jax.extend as jex
 import jax.extend.linear_util as lu
 import jax.numpy as jnp
+import numpy as np
 from flax.core.scope import LazyRng
 from flax.linen.module import Callable, InterceptorContext, intercept_methods
 from flax.typing import RNGSequences
-from jax.core import (
-    AbstractValue, ClosedJaxpr as Jaxpr, ConcreteArray, MainTrace, ShapedArray,
-    Sublevel, Trace, Tracer, find_top_trace, new_main)
+from jax._src.core import set_current_trace  # noqa: PLC2701
+from jax.core import AbstractValue, ShapedArray, Trace, Tracer, find_top_trace
+from jax.extend.core import ClosedJaxpr as Jaxpr
 
 # TODO(@daskol): Make PR on reexporting PyTreeDef.
 try:
@@ -75,12 +76,14 @@ class ModuleTracer(Tracer):
         # cases when we should preserve original concrete values. For example,
         # arguments of binary operation between tracer and numerical literal
         # like `x > 0`. In this case `x` should be evaluated as `ShapedArray`
-        # and zero as `ConcreteArray`. Otherwise, this constant values get
-        # missing in evaluation time.
+        # and zero as a literal. Otherwise, this constant values get missing
+        # in evaluation time.
         if isinstance(self.value, AbstractValue):
             return self.value
+        elif isinstance(self.value, Tracer):
+            return self.value.aval
         else:
-            return jax.api_util.shaped_abstractify(self.value)
+            return jax.typeof(self.value)
 
     def full_lower(self):
         # TODO(@daskol): How to properly implement lowering?
@@ -103,9 +106,8 @@ class ModuleTracer(Tracer):
 
 class ModuleTrace(Trace[ModuleTracer]):
 
-    def __init__(self, main: MainTrace, sublevel: Sublevel, *,
-                 builder: 'MoxBuilder', **kwargs) -> None:
-        super().__init__(main, sublevel)
+    def __init__(self, *, builder: 'MoxBuilder', **kwargs) -> None:
+        super().__init__()
         self.builder: MoxBuilder = builder
 
     def pure(self, val) -> ModuleTracer:
@@ -119,8 +121,12 @@ class ModuleTrace(Trace[ModuleTracer]):
         if isinstance(val, AbstractValue):
             aval = val
         else:
-            aval = jax.core.get_aval(val)
+            aval = jax.typeof(val)
         return ModuleTracer(self, aval)
+
+    def literal(self, val) -> ModuleTracer:
+        """Wrap a concrete value so it is preserved as a MoX literal."""
+        return ModuleTracer(self, val)
 
     def lift(self, tracer: Tracer) -> ModuleTracer:
         return ModuleTracer(self, tracer)
@@ -128,11 +134,21 @@ class ModuleTrace(Trace[ModuleTracer]):
     def sublift(self, tracer: Tracer) -> ModuleTracer:
         return ModuleTracer(self, tracer)
 
+    def full_raise(self, val) -> ModuleTracer:
+        if isinstance(val, ModuleTracer):
+            if val._trace is self:
+                return val
+            return ModuleTracer(self, val)
+        if isinstance(val, Tracer):
+            return ModuleTracer(self, val)
+        return self.literal(val)
+
     def process_primitive(self, prim: jex.core.Primitive, tracers, params):
+        tracers = [self.full_raise(x) for x in tracers]
         result, _ = prim.abstract_eval(*[x.aval for x in tracers], **params)
 
         outs, out_tree = jax.tree.flatten(result)
-        assert all(isinstance(x, ShapedArray) for x in outs if x), \
+        assert all(isinstance(x, AbstractValue) for x in outs if x), \
             'Assumption on type of result is violated: {outs}.'
 
         out_flat_tracers = [ModuleTracer(self, x) for x in outs]
@@ -158,39 +174,49 @@ class ModuleTrace(Trace[ModuleTracer]):
         #       in_tracers = [trace.sublift(t) for t in tracers]
         #       out_tracers = fun.call_wrapped(*in_tracers)
         #       return [trace.full_raise(t) for t in out_tracers]
-        return fun.call_wrapped(*tracers)
+        tracers = [self.full_raise(x) for x in tracers]
+        with set_current_trace(self):
+            return fun.call_wrapped(*tracers)
+
+
+def _is_static_input(val) -> bool:
+    return (
+        not isinstance(val, AbstractValue | Tracer)
+        and isinstance(val, bool | np.bool_)
+    )
 
 
 @lu.transformation
-def _lower(builder: 'MoxBuilder', main: MainTrace, *ins):
-    trace: ModuleTrace = main.with_cur_sublevel()
+def _trace(builder: 'MoxBuilder', *ins):
+    trace = ModuleTrace(builder=builder)
 
-    # NOTE We manually abstractify up to ShapedArray all input arguments.
-    in_tracers = [trace.pure(jax.api_util.shaped_abstractify(x)) for x in ins]
-    builder.set_inputs(in_tracers)
-    outs = yield in_tracers, {}
+    with set_current_trace(trace, True):
+        # NOTE We manually abstractify up to ShapedArray all input arguments.
+        in_tracers, call_args = [], []
+        for x in ins:
+            if _is_static_input(x):
+                in_tracers.append(trace.literal(x))
+                call_args.append(x)
+            else:
+                in_tracers.append(
+                    trace.pure(jax.api_util.shaped_abstractify(x)))
+                call_args.append(in_tracers[-1])
+        builder.set_inputs(in_tracers)
+        outs = yield call_args, {}
 
-    # TODO(@daskol): We do not use output tracers. Should we remove them? This
-    # issue is related to the proper implementation of (sub)lifting and
-    # unboxing that still have quite vague semantics.
-    out_tracers = [trace.full_raise(t) for t in outs]
-    builder.set_outputs(out_tracers)
-    yield out_tracers
-
-
-@lu.transformation
-def _raise(builder, *ins):
-    with new_main(ModuleTrace, True, builder=builder) as main:
-        outs = yield (main, *ins), {}
-        del main
-    yield outs
+        # TODO(@daskol): We do not use output tracers. Should we remove them?
+        # This issue is related to the proper implementation of (sub)lifting
+        # and unboxing that still have quite vague semantics.
+        out_tracers = [trace.full_raise(t) for t in outs]
+        builder.set_outputs(out_tracers)
+        yield out_tracers
 
 
 def trace_modules(wf: lu.WrappedFun, builder: 'MoxBuilder') -> lu.WrappedFun:
-    return _raise(_lower(wf, builder), builder)
+    return _trace(wf, builder)
 
 
-SymbolValueType = TypeVar('SymbolValueType', bound='ShapedArray')
+SymbolValueType = TypeVar('SymbolValueType')
 
 
 @dataclass(slots=True)
@@ -208,6 +234,12 @@ class Symbol(Generic[SymbolValueType]):
     def __hash__(self) -> int:
         return id(self)
 
+    @property
+    def aval(self) -> AbstractValue:
+        if isinstance(self.value, AbstractValue):
+            return self.value
+        return jax.typeof(self.value)
+
 
 @dataclass(slots=True, eq=False)
 class Var(Symbol[ShapedArray]):
@@ -215,17 +247,19 @@ class Var(Symbol[ShapedArray]):
 
 
 @dataclass(slots=True, eq=False)
-class Literal(Symbol[ConcreteArray]):
+class Literal(Symbol[Any]):
+    aval: AbstractValue
+
     @property
     def const(self):
-        return self.value.val
+        return self.value
 
 
 # Check hashability of Symbol hierarchy.
 _ = {
     Symbol(ShapedArray((), jnp.float32)),
     Var(ShapedArray((), jnp.float32)),
-    Literal(ConcreteArray(jnp.float32, jnp.empty(()))),
+    Literal(jnp.empty(()), ShapedArray((), jnp.float32)),
 }
 
 
@@ -397,14 +431,18 @@ class MoxBuilder:
         args = (context.module, ) + args
         (scope, *in_args), child.in_tree = jax.tree.flatten((args, kwargs))
         trace = find_top_trace(flat_vars + in_args)  # TODO(@daskol): Dynamic!
-        in_tracers = [trace.full_raise(a) for a in in_args]
+        in_tracers, call_args = [], []
+        for arg in in_args:
+            tracer = trace.full_raise(arg)
+            in_tracers.append(tracer)
+            call_args.append(arg if _is_static_input(arg) else tracer)
         child.inputs.extend(self.to_symbols(in_tracers))  # XXX
 
         # Flatten function (inputs and outputs) for building intermediate
         # representation.
         wrap_fn = lu.wrap_init(unbound_fn)
         flat_fn, out_tree_fn = jax.api_util.flatten_fun(wrap_fn, child.in_tree)
-        outs = flat_fn.call_wrapped(scope, *in_tracers)
+        outs = flat_fn.call_wrapped(scope, *call_args)
 
         # TODO(@daskol): Remove code duplication with `_lower`.
         flat_outs, _ = jax.tree.flatten(outs)
@@ -447,14 +485,13 @@ class MoxBuilder:
         symbols = []
         for tracer in tracers:
             if (symbol := self.symbols.get(tracer)) is None:
-                match tracer.aval:
-                    case ConcreteArray():
-                        symbol = Literal(tracer.aval)
-                    case ShapedArray():
-                        symbol = Var(tracer.aval)
-                    case _:
-                        raise RuntimeError('Unexpected abstract value of type '
-                                           f'{type(tracer.aval)}.')
+                if isinstance(tracer.value, AbstractValue | Tracer):
+                    symbol = Var(tracer.aval)
+                elif isinstance(tracer.aval, AbstractValue):
+                    symbol = Literal(tracer.value, tracer.aval)
+                else:
+                    raise RuntimeError('Unexpected abstract value of type '
+                                       f'{type(tracer.aval)}.')
                 self.symbols[tracer] = symbol
             symbols += [symbol]
         return symbols
@@ -524,7 +561,9 @@ def dump_yson(expr: Expr, fileobj: IO[bytes], indent: int = 2):
         elif isinstance(val, Jaxpr):
             return val.pretty_print(use_color=False)
         elif callable(val):
-            return f'{val.__module__}.{val.__name__}'
+            name = getattr(val, '__name__', type(val).__name__)
+            module = getattr(val, '__module__', type(val).__module__)
+            return f'{module}.{name}'
         elif hasattr(val, 'dtype'):
             return str(val.dtype)
         else:
@@ -565,7 +604,9 @@ def dump_xml(expr: Expr, fileobj: IO[str], indent: int = 2):
         elif isinstance(val, Jaxpr):
             return val.pretty_print(use_color=False)
         elif callable(val):
-            return f'{val.__module__}.{val.__name__}'
+            name = getattr(val, '__name__', type(val).__name__)
+            module = getattr(val, '__module__', type(val).__module__)
+            return f'{module}.{name}'
         elif hasattr(val, 'dtype'):
             return str(val.dtype)
         else:

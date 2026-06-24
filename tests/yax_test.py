@@ -48,7 +48,7 @@ class TestBinaryFunc:
         eq: Equation = mtree.children[0]
         assert len(eq.inputs) == 2
         assert len(eq.outputs) == 1
-        assert eq.prim.name == 'pjit'
+        assert eq.prim.name == 'jit'
 
         assert 'jaxpr' in eq.params
         jaxpr: ClosedJaxpr = eq.params['jaxpr']

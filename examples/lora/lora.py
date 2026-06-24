@@ -24,6 +24,7 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 from flax.linen.initializers import lecun_normal, zeros_init
+from flax.linen.linear import PromoteDtypeFn, promote_dtype
 from flax.typing import Dtype, Initializer, PrecisionLike
 from jax.tree_util import DictKey, tree_map_with_path
 
@@ -65,6 +66,7 @@ class LoRA(nn.Module):
     precision: PrecisionLike = None
     kernel_init: Initializer = lecun_normal()
     bias_init: Initializer = zeros_init()
+    promote_dtype: PromoteDtypeFn = promote_dtype
 
     @nn.compact
     def __call__(self, xs):
@@ -77,8 +79,9 @@ class LoRA(nn.Module):
         rhs = self.param('rhs', self.rhs_init, rhs_shape, self.param_dtype)
 
         kwargs = dict(use_bias=self.use_bias, dtype=self.dtype,
-                      param_dtype=self.dtype, precision=self.precision,
-                      kernel_init=self.kernel_init, bias_init=self.bias_init)
+                      param_dtype=self.param_dtype, precision=self.precision,
+                      kernel_init=self.kernel_init, bias_init=self.bias_init,
+                      promote_dtype=self.promote_dtype)
         if self.original_name:
             kwargs['name'] = self.original_name
 

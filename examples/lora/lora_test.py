@@ -5,7 +5,6 @@ import jax
 import jax.numpy as jnp
 import pytest
 from numpy.testing import assert_allclose
-from transformers import FlaxRobertaForSequenceClassification as RoBERTa
 
 from lora import Params, lora, mask_by_prefix, merge, split
 from yax import eval_mox, make_mox, query
@@ -53,8 +52,8 @@ def test_simple():
 
     # 4. Merge LoRA-adapter to original fully-connected layer.
     merged_params = merge(lora_params)
-    flat_merged_params, merged_tree = jax.tree_flatten(merged_params)
-    flat_params, tree = jax.tree_flatten(params)
+    flat_merged_params, merged_tree = jax.tree.flatten(merged_params)
+    flat_params, tree = jax.tree.flatten(params)
     assert merged_tree == tree
     for actual, desired in zip(flat_merged_params, flat_params):
         assert_allclose(actual, desired)
@@ -63,6 +62,9 @@ def test_simple():
 
 @pytest.mark.slow
 def test_roberta():
+    transformers = pytest.importorskip('transformers')
+    RoBERTa = transformers.FlaxRobertaForSequenceClassification
+
     # 0. Load model and create application function (HuggingFace stores weights
     #    as a part of the model).
     model = RoBERTa.from_pretrained('roberta-base')
@@ -103,8 +105,8 @@ def test_roberta():
 
     # 4. Merge LoRA-adapter to original fully-connected layer.
     params_merged = merge(params_lora)
-    flat_params_merged, merged_tree = jax.tree_flatten(params_merged)
-    flat_params, tree = jax.tree_flatten(params)
+    flat_params_merged, merged_tree = jax.tree.flatten(params_merged)
+    flat_params, tree = jax.tree.flatten(params)
     assert merged_tree == tree
     for actual, desired in zip(flat_params_merged, flat_params):
         assert_allclose(actual, desired)

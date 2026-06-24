@@ -128,7 +128,7 @@ def dummy():
 
 def test_update_in_trees(dummy: Mox):
     """Test substitution with new `Equation`."""
-    relu_expr, *_ = query('//[@primitive="pjit"][@name="relu"]', dummy)
+    relu_expr, *_ = query('//[@primitive="jit"][@name="relu"]', dummy)
     assert isinstance(relu_expr, Equation), 'Equation for relu is expected.'
 
     def act(xs, ys):
@@ -228,7 +228,7 @@ def test_update_var_trees(dummy: Mox):
     # Verify consistency of the root node.
     root, *_ = parents
     (lhs_params, *_), _ = root.in_tree.unflatten(root.inputs)
-    syms, var_tree = jax.tree_flatten(params)
+    syms, var_tree = jax.tree.flatten(params)
     assert var_tree != var_trees[0], 'Params tree must differs.'
 
     args_tree, _ = in_trees[0].children()
@@ -250,7 +250,7 @@ def test_sub_callable(mlp: ModelState):
         assert isinstance(gelu_expr, Equation)
         return gelu_expr
 
-    mox = sub('//[@primitive="pjit"][@name="relu"]', sub_fn, mlp.mox)
+    mox = sub('//[@primitive="jit"][@name="relu"]', sub_fn, mlp.mox)
     actual = eval_mox(mox, mlp.params, mlp.batch)
     desired = mlp.model.apply(mlp.params, mlp.batch)
     assert_allclose(actual, desired)
@@ -262,7 +262,7 @@ class TestSub:
         gelu_mox = make_mox(jax.jit(jax.nn.gelu))(mlp.batch)
         gelu_expr = gelu_mox.children[0]
         assert isinstance(gelu_expr, Equation)
-        mox = sub('//[@primitive="pjit"][@name="relu"]', gelu_expr, mlp.mox)
+        mox = sub('//[@primitive="jit"][@name="relu"]', gelu_expr, mlp.mox)
 
         actual = eval_mox(mox, mlp.params, mlp.batch)
         desired = mlp.model.apply(mlp.params, mlp.batch)
