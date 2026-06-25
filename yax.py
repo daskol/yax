@@ -980,8 +980,8 @@ def eval_mox(tree: Mox, *args, **kwargs):
 
     def read(var: Symbol) -> Any:
         """Read a symbol from execution context or take literal value."""
-        if (val := env.get(var)) is not None:
-            return val
+        if var in env:
+            return env[var]
         if isinstance(var, Literal):
             return var.const
         raise KeyError(f'Variable {var} is undefined.')
@@ -1255,10 +1255,10 @@ def validate_symbols(actual: list[Symbol], desired: list[Symbol],
     else:
         what = 'Symbol'
     if len(actual) != len(desired):
-        raise RuntimeError(f'Number of {what.tolower()} differ: '
+        raise RuntimeError(f'Number of {what.lower()} differ: '
                            f'{len(actual)} != {len(desired)}.')
     for pair in zip(actual, desired):
-        lhs, rhs = [s.value for s in pair]
+        lhs, rhs = [s.aval for s in pair]
         if lhs.shape != rhs.shape:
             raise RuntimeError(
                 f'{what} shapes differ: {lhs.shape} != {rhs.shape}.')
