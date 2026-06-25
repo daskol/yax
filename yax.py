@@ -23,8 +23,8 @@ from functools import partial, wraps
 from io import StringIO
 from json import dumps
 from typing import (
-    IO, Any, ClassVar, Generic, ParamSpec, Self, Sequence, Type, TypeAlias,
-    TypeVar)
+    IO, Any, ClassVar, Generic, Mapping, ParamSpec, Self, Sequence, Type,
+    TypeAlias, TypeVar)
 from xml.etree.ElementTree import (
     Element, ElementTree, SubElement, indent as indent_etree)
 
@@ -48,8 +48,9 @@ try:
 except ImportError:
     from jax.tree_util import PyTreeDef
 
-__all__ = ('Equation', 'Expr', 'Literal', 'Mox', 'Symbol', 'Var', 'dump_yson',
-           'dump_xml', 'eval_mox', 'make_mox', 'map_mox', 'query', 'sub')
+__all__ = ('Branch', 'Equation', 'Expr', 'Literal', 'Mox', 'Static',
+           'Symbol', 'Var', 'branch', 'dump_yson', 'dump_xml', 'eval_mox',
+           'make_mox', 'map_mox', 'query', 'sub')
 
 # TODO(@daskol): Python 3.12 introduced new type parameter syntax (PEP-0695)
 # but some code quality tools (e.g. yapf) do not support this syntax.
@@ -255,12 +256,27 @@ class Literal(Symbol[Any]):
         return self.value
 
 
+@dataclass(slots=True, eq=False)
+class Static(Symbol[str]):
+    """A named Python-static input selected at evaluation time."""
+
+    @property
+    def name(self) -> str:
+        return self.value
+
+
 # Check hashability of Symbol hierarchy.
 _ = {
+    Static('kwarg'),
     Symbol(ShapedArray((), jnp.float32)),
     Var(ShapedArray((), jnp.float32)),
     Literal(jnp.empty(()), ShapedArray((), jnp.float32)),
 }
+
+
+def default_treedef(default=()) -> PyTreeDef:
+    _, treedef = jax.tree.flatten(default)
+    return treedef
 
 
 @dataclass(slots=True)
@@ -284,9 +300,31 @@ class Equation(Expr):
         return {**self.params, 'primitive': self.prim.name}
 
 
-def default_treedef(default=()) -> PyTreeDef:
-    _, treedef = jax.tree.flatten(default)
-    return treedef
+BranchKey: TypeAlias = str | bool
+
+
+@dataclass(slots=True)
+class Branch(Expr):
+    """Static branching expression."""
+
+    selector_name: str
+    selector: Static
+    cases: dict[BranchKey, Expr]
+    var_tree: PyTreeDef = field(default_factory=default_treedef)
+
+    def to_dict(self, recursively=True) -> dict[str, Any]:
+        res = {
+            **self.params,
+            'primitive': 'static_branch',
+            'selector': self.selector_name,
+            'cases': tuple(self.cases.keys()),
+        }
+        if recursively:
+            res['children'] = {
+                key: val.to_dict() if hasattr(val, 'to_dict') else {}
+                for key, val in self.cases.items()
+            }
+        return res
 
 
 @dataclass(slots=True)
@@ -340,6 +378,155 @@ class Mox(Expr):
             return getattr(obj, '__name__', str(obj))
         return dumps(self.to_dict(), ensure_ascii=False, indent=indent,
                      default=default)
+
+
+def param_count(expr: Expr) -> int:
+    if isinstance(expr, Mox | Branch):
+        return expr.var_tree.num_leaves
+    return 0
+
+
+def external_inputs(expr: Expr) -> list[Symbol]:
+    num_params = param_count(expr)
+    if isinstance(expr, Branch):
+        return expr.inputs[num_params + 1:]
+    return expr.inputs[num_params:]
+
+
+def set_external_inputs(expr: Expr, inputs: Sequence[Symbol]) -> None:
+    num_params = param_count(expr)
+    if isinstance(expr, Branch):
+        expr.inputs = expr.inputs[:num_params + 1] + [*inputs]
+    else:
+        expr.inputs = expr.inputs[:num_params] + [*inputs]
+
+
+def clone_symbol(sym: Symbol) -> Symbol:
+    if isinstance(sym, Static):
+        return Static(sym.value)
+    if isinstance(sym, Literal):
+        return Literal(sym.value, sym.aval)
+    if isinstance(sym, Var):
+        return Var(sym.value)
+    return Symbol(sym.value)
+
+
+def clone_expr(expr: Expr, memo: dict[Symbol, Symbol] | None = None) -> Expr:
+    if memo is None:
+        memo = {}
+
+    def clone(sym: Symbol) -> Symbol:
+        if sym not in memo:
+            memo[sym] = clone_symbol(sym)
+        return memo[sym]
+
+    obj = copy(expr)
+    obj.inputs = [clone(s) for s in expr.inputs]
+    obj.outputs = [clone(s) for s in expr.outputs]
+    obj.params = {**expr.params}
+    if isinstance(expr, Mox):
+        obj.children = [clone_expr(child, memo) for child in expr.children]
+        obj.rngs = {
+            name: LazyRng(clone(rng.rng), rng.suffix)
+            for name, rng in expr.rngs.items()
+        }
+    elif isinstance(expr, Branch):
+        obj.selector = clone(expr.selector)
+        obj.cases = {
+            key: clone_expr(case, memo)
+            for key, case in expr.cases.items()
+        }
+    return obj
+
+
+def replace_symbols(expr: Expr, mapping: Mapping[Symbol, Symbol]) -> None:
+    def replace(sym: Symbol) -> Symbol:
+        return mapping.get(sym, sym)
+
+    expr.inputs = [replace(s) for s in expr.inputs]
+    expr.outputs = [replace(s) for s in expr.outputs]
+    if isinstance(expr, Mox):
+        expr.children = [child for child in expr.children]
+        expr.rngs = {
+            name: LazyRng(replace(rng.rng), rng.suffix)
+            for name, rng in expr.rngs.items()
+        }
+        for child in expr.children:
+            replace_symbols(child, mapping)
+    elif isinstance(expr, Branch):
+        expr.selector = replace(expr.selector)
+        for case in expr.cases.values():
+            replace_symbols(case, mapping)
+
+
+def normalize_branch_key(key: Any, *, selector_name='selector') -> BranchKey:
+    if isinstance(key, np.bool_):
+        return bool(key)
+    if isinstance(key, bool):
+        return key
+    if isinstance(key, str):
+        return key
+    if isinstance(key, Tracer) or hasattr(key, 'aval'):
+        raise TypeError(
+            f'Static branch selector {selector_name!r} must be a Python '
+            f'str or bool, not {type(key).__name__}.')
+    raise TypeError(
+        f'Unsupported static branch key {key!r} of type {type(key).__name__}.')
+
+
+def merge_branch_params(cases: Mapping[BranchKey, Expr]) \
+        -> tuple[list[Symbol], PyTreeDef, dict[Symbol, Symbol]]:
+    """Merge case parameter symbols by variable path and symbol identity."""
+    raise NotImplementedError
+
+
+def branch(selector_name: str,
+           cases: Mapping[str | bool | np.bool_, Expr],
+           *, name: str | None = None) -> Branch:
+    """Build a static branch expression selected by a named kwarg."""
+    if not isinstance(selector_name, str) or not selector_name:
+        raise ValueError('Branch selector name must be a non-empty string.')
+    if not cases:
+        raise ValueError('Static branch requires at least one case.')
+
+    normalized: dict[BranchKey, Expr] = {}
+    for key, expr in cases.items():
+        norm_key = normalize_branch_key(key, selector_name=selector_name)
+        if norm_key in normalized:
+            raise ValueError(f'Duplicate static branch key {norm_key!r}.')
+        if not isinstance(expr, Expr):
+            raise TypeError(
+                f'Branch case {norm_key!r} must be an {type(Expr).__name__}, '
+                f'not {type(expr).__name__}.')
+        normalized[norm_key] = clone_expr(expr)
+
+    first_case = next(iter(normalized.values()))
+    first_inputs = [*external_inputs(first_case)]
+    first_outputs = [*first_case.outputs]
+    for key, case in tuple(normalized.items())[1:]:
+        validate_symbols(first_inputs, external_inputs(case),
+                         f'case {key!r} input')
+        validate_symbols(first_outputs, case.outputs, f'case {key!r} output')
+
+    params, var_tree, param_mapping = merge_branch_params(normalized)
+    for case in normalized.values():
+        replace_symbols(case, param_mapping)
+
+    # Recompute after parameter rewrites in case a boundary intentionally
+    # aliases a parameter symbol.
+    first_inputs = [*external_inputs(first_case)]
+    first_outputs = [*first_case.outputs]
+    for case in tuple(normalized.values())[1:]:
+        input_mapping = dict(zip(external_inputs(case), first_inputs))
+        output_mapping = dict(zip(case.outputs, first_outputs))
+        replace_symbols(case, input_mapping | output_mapping)
+        set_external_inputs(case, first_inputs)
+        case.outputs = first_outputs
+
+    selector = Static(selector_name)
+    return Branch(params + [selector] + first_inputs, first_outputs,
+                  {'name': name}, selector_name, selector, normalized,
+                  var_tree)
 
 
 def make_mox(fn: Callable[Args, Any]) -> Callable[Args, Mox]:
