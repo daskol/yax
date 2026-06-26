@@ -484,3 +484,50 @@ def test_sub_inside_existing_branch_case_is_unsupported():
 
     with pytest.raises(NotImplementedError, match='inside static branch'):
         sub('//jit', make_eq(absolute), mox)
+
+
+class Model(nn.Module):
+
+    @nn.compact
+    def __call__(self, xs):
+        return nn.Dense(3, use_bias=False)(xs)
+
+
+def test_sub_adapter():
+    """Real-world example specific to PEFT and low-rank adaptation."""
+    xs = jnp.arange(2, dtype=jnp.float32)
+
+    def make_expr(module_ty: Type[nn.Module], **kwargs) -> Mox:
+        module = module_ty(**kwargs)
+        params = module.init(jax.random.key(42), xs)
+        return make_mox(module.apply)(params, xs).children[0]
+
+    model = Model()
+    params = model.init(jax.random.key(0), xs)
+    mox = make_mox(model.apply)(params, xs)
+    [dense_no_bias] = query('//[@type="Dense"]', mox)
+    assert isinstance(dense_no_bias, Mox)
+
+    dense = make_expr(nn.Dense, features=3, use_bias=True)
+    br = branch('use_bias', {False: dense_no_bias, True: dense})
+
+    patched = sub('//[@type="Dense"]', br, mox)
+    variables = {
+        'params': {
+            'Dense_0': {
+                **params['params']['Dense_0'],
+                'bias': jnp.arange(3, dtype=jnp.float32),
+            },
+        },
+    }
+    ys = eval_mox(patched, variables, xs, use_bias=True)
+    zs = eval_mox(patched, variables, xs, use_bias=False)
+
+    dense_with_bias = nn.Dense(3, use_bias=True)
+    dense_without_bias = nn.Dense(3, use_bias=False)
+    ys_expected = dense_with_bias.apply(
+        {'params': variables['params']['Dense_0']}, xs)
+    zs_expected = dense_without_bias.apply(
+        {'params': {'kernel': variables['params']['Dense_0']['kernel']}}, xs)
+    assert_allclose(ys, ys_expected)
+    assert_allclose(zs, zs_expected)
