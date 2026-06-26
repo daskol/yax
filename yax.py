@@ -17,6 +17,7 @@ building, querying, and mutation.
 """
 
 import re
+from collections import defaultdict
 from copy import copy
 from dataclasses import dataclass, field, fields
 from functools import partial, wraps
@@ -24,7 +25,7 @@ from io import StringIO
 from json import dumps
 from typing import (
     IO, Any, ClassVar, Generic, Mapping, ParamSpec, Self, Sequence, Type,
-    TypeAlias, TypeVar)
+    TypeAlias, TypeVar, cast)
 from xml.etree.ElementTree import (
     Element, ElementTree, SubElement, indent as indent_etree)
 
@@ -41,6 +42,7 @@ from flax.typing import RNGSequences
 from jax._src.core import set_current_trace  # noqa: PLC2701
 from jax.core import AbstractValue, ShapedArray, Trace, Tracer, find_top_trace
 from jax.extend.core import ClosedJaxpr as Jaxpr
+from jax.tree_util import DictKey, SequenceKey
 
 # TODO(@daskol): Make PR on reexporting PyTreeDef.
 try:
@@ -55,6 +57,8 @@ __all__ = ('Branch', 'Equation', 'Expr', 'Literal', 'Mox', 'Static',
 # TODO(@daskol): Python 3.12 introduced new type parameter syntax (PEP-0695)
 # but some code quality tools (e.g. yapf) do not support this syntax.
 Args = ParamSpec('Args')
+
+ArrayTree: TypeAlias = Mapping[str, Any]
 
 
 class ModuleTracer(Tracer):
@@ -393,6 +397,27 @@ def external_inputs(expr: Expr) -> list[Symbol]:
     return expr.inputs[num_params:]
 
 
+def external_params(expr: Expr) -> list[Symbol]:
+    num_params = param_count(expr)
+    if isinstance(expr, Branch):
+        return expr.inputs[:num_params + 1]
+    return expr.inputs[:num_params]
+
+
+def external_param_tree(expr: Expr) -> ArrayTree:
+    leaves = external_params(expr)
+    match expr:
+        case Mox():
+            node = cast(Mox, expr)
+        case Branch():
+            node = cast(Branch, expr)
+        case _:
+            raise RuntimeError(
+                f'No treedef for an object of type {type(expr).__name__}.')
+    params = jax.tree.unflatten(node.var_tree, params)
+    return params
+
+
 def set_external_inputs(expr: Expr, inputs: Sequence[Symbol]) -> None:
     num_params = param_count(expr)
     if isinstance(expr, Branch):
@@ -472,6 +497,105 @@ def normalize_branch_key(key: Any, *, selector_name='selector') -> BranchKey:
             f'str or bool, not {type(key).__name__}.')
     raise TypeError(
         f'Unsupported static branch key {key!r} of type {type(key).__name__}.')
+
+
+Key: TypeAlias = str | int
+
+KeyPath: TypeAlias = tuple[DictKey | SequenceKey, ...]
+
+
+def unwrap_key_path(kp: KeyPath) -> tuple[str, ]:
+    parts = []
+    for part in kp:
+        match part:
+            case DictKey():
+                parts.append(part.key)
+            case SequenceKey():
+                parts.append(part.id)
+            case _:
+                raise RuntimeError(
+                    f'Unexpected type of key part: {type(part)}.')
+    return tuple(parts)
+
+
+def to_flat_dict(at: ArrayTree) \
+        -> tuple[dict[Key, Array], list[Key], PyTreeDef]:
+    ix: list[Key] = []
+    res: dict[Key, Array] = {}
+
+    def fn_leaf(leaf: tuple[KeyPath, Any]):
+        key = unwrap_key_path(leaf[0])
+        nonlocal ix, res
+        ix.append(key)
+        res[key] = leaf[1]
+
+    def fn_node(*args):
+        pass
+
+    leaves, treedef = jax.tree.flatten_with_path(at, is_leaf_takes_path=True)
+    treedef.walk(fn_node, fn_leaf, leaves)  # type: ignore[attr-defined]
+    return res, ix, treedef
+
+
+def from_flat_dict[T](ix: list[T], treedef: PyTreeDef,
+                      mapping: dict[T, Any]) -> ArrayTree:
+    leaves = [mapping[key] for key in ix]
+    return jax.tree.unflatten(treedef, leaves)
+
+
+def reconstruct(flat_dict: Mapping[Key, Any]):
+    """Reconstruct array tree from flat dictionary.
+
+    >>> reconstruct({('a', 'a'): 1, ('a', 'b'): 2, ('b', ): 3})
+    {'a': {'a': 1, 'b': 2}, 'b': 3}
+    >>> reconstruct({(0, 'a'): 1, (0, 'b'): 2, (1, 'a'): 3})
+    [{'a': 1, 'b': 2}, {'a': 3}]
+    """
+
+    if () in flat_dict and len(flat_dict) == 1:
+        return flat_dict[()]  # Leaf.
+    elif () in flat_dict:
+        raise RuntimeError(
+            f'Internal nodes and leaves interleave together: {flat_dict}.')
+
+    groups: dict[Key, Mapping[Key, Any]] = defaultdict(dict)
+    for key, leaf in flat_dict.items():
+        head, *rest = key
+        tail = tuple(rest)
+        groups[head][tail] = leaf
+
+    if isinstance(key := next(iter(groups)), int):
+        return [reconstruct(groups[i]) for i in range(len(groups))]
+
+    return {key: reconstruct(group) for key, group in groups.items()}
+
+
+def map_param_tree(fn: Callable[[Sequence[ArrayTree | None]], Any],
+                   trees: Sequence[ArrayTree] ) -> dict[str, Any]:
+    """Apply `fn` to all leaves of union of `trees`.
+
+    >>> xs = {'params': {'kernel': jnp.eye(2)}}
+    >>> ys = {'params': {'bias': jnp.zeros(2)}}
+    >>> fn = lambda args: [a for a in args if a is not None][0]
+    >>> res = map_param_tree(fn, (xs, ys))
+    >>> jax.tree.map(jnp.shape, res)
+    {'params': {'bias': (2,), 'kernel': (2, 2)}}
+    """
+    if len(trees) < 1:
+        raise RuntimeError('At least one tree requires.')
+
+    mappings, key_indices, _ = zip(*[to_flat_dict(tree) for tree in trees])
+
+    keys = set()
+    for key_index in key_indices:
+        keys |= set(key_index)
+
+    res: dict[KeyPath, Any] = {}
+    for key in sorted(keys):
+        args = [m.get(key) for m in mappings]
+        res[key] = fn(args)
+
+    return reconstruct(res)
 
 
 def merge_branch_params(cases: Mapping[BranchKey, Expr]) \

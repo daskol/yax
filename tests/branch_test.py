@@ -14,12 +14,13 @@
 
 from collections.abc import Mapping
 
+import flax.linen as nn
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import flax.linen as nn
+from numpy.testing import assert_array_equal
 
-from yax import Static, branch, make_mox, merge_branch_params
+from yax import Static, branch, make_mox, map_param_tree, reconstruct
 
 
 def absolute(xs):
@@ -63,8 +64,44 @@ class Scale(nn.Module):
         return xs * scale
 
 
-def test_merge_branch_params():
-    pass
+def test_reconstruct_dict_dict():
+    res = reconstruct({('a', 'a'): 1, ('a', 'b'): 2, ('b', 'a'): 3})
+    assert res['a']['a'] == 1
+    assert res['a']['b'] == 2
+    assert res['b']['a'] == 3
+
+
+def test_reconstruct_dict_list():
+    res = reconstruct({('a', 0): 1, ('a', 1): 2, ('b', 'a'): 3})
+    assert res['a'] == [1, 2]
+    assert res['b']['a'] == 3
+
+
+def test_reconstruct_list_dict():
+    res = reconstruct({(0, 'a'): 1, (0, 'b'): 2, (1, 'a'): 3})
+    assert res[0]['a'] == 1
+    assert res[0]['b'] == 2
+    assert res[1]['a'] == 3
+
+
+def test_reconstruct_interleaved():
+    with pytest.raises(RuntimeError, match='interleave together'):
+        reconstruct({('a', 'a'): 1, ('a', 'b'): 2, ('a', ): 3})
+
+
+def test_map_param_tree():
+    xs = {'params': {'kernel': jnp.eye(2)}}
+    ys = {'params': {'bias': jnp.zeros(2)}}
+
+    def fn(leaves):
+        for leaf in (x for x in leaves if x is not None):
+            return leaf
+        else:
+            raise RuntimeError(f'No defined leaves: {leaves}.')
+
+    res = map_param_tree(fn, (xs, ys))
+    assert_array_equal(res['params']['kernel'], xs['params']['kernel'])
+    assert_array_equal(res['params']['bias'], ys['params']['bias'])
 
 
 def test_branch_key_normalization():
