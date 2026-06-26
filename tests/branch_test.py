@@ -62,6 +62,27 @@ class DuplicateCases(Mapping):
         return self._items
 
 
+class Pass(nn.Module):
+
+    @nn.compact
+    def __call__(self, xs):
+        return xs + 0.0
+
+
+class SinglePass(nn.Module):
+
+    @nn.compact
+    def __call__(self, xs):
+        return Pass()(xs)
+
+
+class TwoPass(nn.Module):
+
+    @nn.compact
+    def __call__(self, xs):
+        return Pass(name='left')(xs) + Pass(name='right')(xs)
+
+
 class Scale(nn.Module):
 
     @nn.compact
@@ -78,6 +99,17 @@ class Shift(nn.Module):
         *_, features = xs.shape
         shift = self.param('shift', nn.initializers.ones, (features, ))
         return xs + shift
+
+
+def module_case(module: nn.Module, xs):
+    params = module.init(jax.random.key(0), xs)
+    return make_mox(module.apply)(params, xs).children[0]
+
+
+def pass_mox(xs):
+    model = SinglePass()
+    params = model.init(jax.random.key(1), xs)
+    return make_mox(model.apply)(params, xs)
 
 
 def test_reconstruct_empty():
@@ -221,3 +253,32 @@ def test_dump_yson():
     assert obj.attributes['primitive'] == 'static_branch'
     assert obj.attributes['selector'] == 'mode'
     assert len(obj) == 2
+
+
+def test_branch_query_and_dumps():
+    xs = jnp.ones((2,))
+    mox = pass_mox(xs)
+    sub('//[@type="Pass"]', branch('mode', {
+        'neg': make_eq(negate),
+        'abs': make_eq(absolute),
+    }), mox)
+
+    [node] = query('//static_branch', mox)
+    assert isinstance(node, Branch)
+    assert len(query('//jit', mox)) == 2
+    assert node.to_dict(False)['primitive'] == 'static_branch'
+
+    buf = StringIO()
+    dump(mox, buf)
+    assert 'static_branch' in buf.getvalue()
+
+    buf = StringIO()
+    dump_xml(mox, buf)
+    assert ElementTree.fromstring(buf.getvalue()).find('.//static_branch') \
+        is not None
+
+    yt_yson = pytest.importorskip('yt.yson')
+    buf = BytesIO()
+    dump_yson(mox, buf)
+    obj = yt_yson.loads(buf.getvalue())
+    assert b'static_branch' in yt_yson.dumps(obj)

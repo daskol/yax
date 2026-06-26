@@ -1716,7 +1716,7 @@ def query(expr: str | XPath, mox: Mox) -> Sequence[Any]:
     return nodes
 
 
-NodeSet: TypeAlias = Sequence[Mox | Equation]
+NodeSet: TypeAlias = Sequence[Mox | Equation | Branch]
 
 
 def filter_nodes(predicates: Sequence[LocationPredicate],
@@ -1729,7 +1729,7 @@ def filter_nodes(predicates: Sequence[LocationPredicate],
 
     nodes = []
     for node in node_set:
-        if isinstance(node, Mox):
+        if isinstance(node, Mox | Branch):
             attrs = node.to_dict(False)
         elif isinstance(node, Equation):
             attrs = node.to_dict()
@@ -1743,6 +1743,8 @@ def select_all_descendants(node_set: NodeSet) -> NodeSet:
     for node in node_set:
         if isinstance(node, Mox):
             nodes += select_all_descendants(node.children)
+        elif isinstance(node, Branch):
+            nodes += select_all_descendants(tuple(node.cases.values()))
     return tuple(nodes)
 
 
@@ -1751,6 +1753,8 @@ def select_children(node_set: NodeSet) -> NodeSet:
     for node in node_set:
         if isinstance(node, Mox):
             nodes += node.children
+        elif isinstance(node, Branch):
+            nodes += node.cases.values()
     return tuple(nodes)
 
 
@@ -1759,6 +1763,8 @@ def select_nodes(name: str, node_set: NodeSet) -> NodeSet:
         match node:
             case Mox():
                 return name == 'module_call'
+            case Branch():
+                return name == 'static_branch'
             case Equation():
                 return name == node.prim.name
 
