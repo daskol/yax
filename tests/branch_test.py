@@ -22,11 +22,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from numpy.testing import assert_array_equal
+from numpy.testing import assert_allclose, assert_array_equal
 
 from yax import (
-    ShapedArray, Static, Symbol, branch, make_mox, map_param_tree,
-    merge_branch_params, reconstruct)
+    Branch, Mox, ShapedArray, Static, Symbol, Var, branch, dump, dump_xml,
+    dump_yson, eval_mox, make_mox, map_param_tree, merge_branch_params, query,
+    reconstruct, sub)
 
 
 def absolute(xs):
@@ -90,6 +91,15 @@ class Scale(nn.Module):
         *_, features = xs.shape
         kernel = self.param('scale', nn.initializers.ones, (features, ) * 2)
         return xs @ kernel
+
+
+class ScalePlus(nn.Module):
+
+    @nn.compact
+    def __call__(self, xs):
+        *_, features = xs.shape
+        kernel = self.param('scale', nn.initializers.ones, (features, ) * 2)
+        return xs @ kernel + 1.0
 
 
 class Shift(nn.Module):
@@ -255,6 +265,186 @@ def test_dump_yson():
     assert len(obj) == 2
 
 
+def test_replace_module_with_branch_and_eval_modes():
+    xs = jnp.ones((2,))
+    mox = pass_mox(xs)
+    replacement = branch('mode', {
+        'scale': module_case(Scale(), xs),
+        'shift': module_case(Shift(), xs),
+    })
+
+    sub('//[@type="Pass"]', replacement, mox)
+    variables = {
+        'params': {
+            'Pass_0': {
+                'scale': jnp.eye(xs.shape[-1]) * 3.0,
+                'shift': jnp.full(xs.shape, 5.0),
+            },
+        },
+    }
+
+    assert_allclose(eval_mox(mox, variables, xs, mode='scale'), xs * 3.0)
+    assert_allclose(eval_mox(mox, variables, xs, mode='shift'), xs + 5.0)
+
+
+def test_only_selected_case_runs_with_shared_outputs():
+    xs = jnp.array([-1.0, 2.0])
+    mox = pass_mox(xs)
+    replacement = branch('mode', {
+        'neg': make_eq(negate),
+        'abs': make_eq(absolute),
+    })
+
+    sub('//[@type="Pass"]', replacement, mox)
+
+    # Both cases share output symbols after branch construction. Evaluating
+    # both cases would attempt to write the same symbol twice.
+    assert_allclose(eval_mox(mox, {}, xs, mode='neg'), negate(xs))
+    assert_allclose(eval_mox(mox, {}, xs, mode='abs'), absolute(xs))
+
+
+def test_shared_parameter_path_uses_one_runtime_leaf():
+    xs = jnp.ones((2,))
+    replacement = branch('mode', {
+        'scale': module_case(Scale(), xs),
+        'plus': module_case(ScalePlus(), xs),
+    })
+
+    assert replacement.var_tree.num_leaves == 1
+    [shared] = replacement.inputs[:replacement.var_tree.num_leaves]
+    for case in replacement.cases.values():
+        assert case.inputs[0] is shared
+
+    mox = pass_mox(xs)
+    sub('//[@type="Pass"]', replacement, mox)
+
+    variables = {'params': {'Pass_0': {'scale': jnp.eye(xs.shape[-1]) * 2.0}}}
+    assert_allclose(eval_mox(mox, variables, xs, mode='scale'), xs * 2.0)
+    assert_allclose(eval_mox(mox, variables, xs, mode='plus'), xs * 2.0 + 1.0)
+
+    variables = {'params': {'Pass_0': {'scale': jnp.eye(xs.shape[-1]) * 4.0}}}
+    assert_allclose(eval_mox(mox, variables, xs, mode='scale'), xs * 4.0)
+    assert_allclose(eval_mox(mox, variables, xs, mode='plus'), xs * 4.0 + 1.0)
+
+
+def test_same_symbol_alias_in_one_tree_is_rejected():
+    param = Var(ShapedArray((2,), jnp.float32))
+    xs = Var(ShapedArray((2,), jnp.float32))
+    ys = Var(ShapedArray((2,), jnp.float32))
+    params, var_tree = jax.tree.flatten({'params': {'a': param, 'b': param}})
+    case = Mox(params + [xs], [ys], {}, var_tree=var_tree)
+
+    with pytest.raises(RuntimeError, match='multiple variable paths'):
+        branch('mode', {'a': case, 'b': case})
+
+
+def test_same_symbol_alias_across_case_paths_is_rejected():
+    param = Var(ShapedArray((2,), jnp.float32))
+    xs = Var(ShapedArray((2,), jnp.float32))
+    ys = Var(ShapedArray((2,), jnp.float32))
+    lhs_params, lhs_tree = jax.tree.flatten({'params': {'a': param}})
+    rhs_params, rhs_tree = jax.tree.flatten({'params': {'b': param}})
+    lhs = Mox(lhs_params + [xs], [ys], {}, var_tree=lhs_tree)
+    rhs = Mox(rhs_params + [xs], [ys], {}, var_tree=rhs_tree)
+
+    with pytest.raises(RuntimeError, match='multiple variable paths'):
+        branch('mode', {'lhs': lhs, 'rhs': rhs})
+
+
+def test_incompatible_repeated_parameter_path_is_rejected():
+    xs = Var(ShapedArray((2,), jnp.float32))
+    ys = Var(ShapedArray((2,), jnp.float32))
+    lhs_param = Var(ShapedArray((2,), jnp.float32))
+    rhs_param = Var(ShapedArray((3,), jnp.float32))
+    lhs_params, lhs_tree = jax.tree.flatten({'params': {'scale': lhs_param}})
+    rhs_params, rhs_tree = jax.tree.flatten({'params': {'scale': rhs_param}})
+    lhs = Mox(lhs_params + [xs], [ys], {}, var_tree=lhs_tree)
+    rhs = Mox(rhs_params + [xs], [ys], {}, var_tree=rhs_tree)
+
+    with pytest.raises(RuntimeError, match='Parameter symbol shapes differ'):
+        branch('mode', {'lhs': lhs, 'rhs': rhs})
+
+
+def test_incompatible_repeated_parameter_path_dtype_is_rejected():
+    xs = Var(ShapedArray((2,), jnp.float32))
+    ys = Var(ShapedArray((2,), jnp.float32))
+    lhs_param = Var(ShapedArray((2,), jnp.float32))
+    rhs_param = Var(ShapedArray((2,), jnp.int32))
+    lhs_params, lhs_tree = jax.tree.flatten({'params': {'scale': lhs_param}})
+    rhs_params, rhs_tree = jax.tree.flatten({'params': {'scale': rhs_param}})
+    lhs = Mox(lhs_params + [xs], [ys], {}, var_tree=lhs_tree)
+    rhs = Mox(rhs_params + [xs], [ys], {}, var_tree=rhs_tree)
+
+    with pytest.raises(RuntimeError, match='Parameter symbol dtypes differ'):
+        branch('mode', {'lhs': lhs, 'rhs': rhs})
+
+
+def test_multiple_branches_share_one_root_selector():
+    xs = jnp.array([-1.0, 2.0])
+    model = TwoPass()
+    params = model.init(jax.random.key(0), xs)
+    mox = make_mox(model.apply)(params, xs)
+    replacement = branch('mode', {
+        'neg': make_eq(negate),
+        'abs': make_eq(absolute),
+    })
+
+    sub('//[@type="Pass"]', replacement, mox)
+
+    selectors = [sym for sym in mox.inputs if isinstance(sym, Static)]
+    assert len(selectors) == 1
+    assert selectors[0].name == 'mode'
+    assert_allclose(eval_mox(mox, {}, xs, mode='neg'), negate(xs) * 2.0)
+    assert_allclose(eval_mox(mox, {}, xs, mode='abs'), absolute(xs) * 2.0)
+
+
+def test_bool_selector_and_eval_errors():
+    xs = jnp.ones((2,))
+    mox = pass_mox(xs)
+    sub('//[@type="Pass"]', branch('flag', {
+        True: make_eq(negate),
+        False: make_eq(absolute),
+    }), mox)
+
+    assert_allclose(eval_mox(mox, {}, xs, flag=True), negate(xs))
+    assert_allclose(eval_mox(mox, {}, xs, flag=np.bool_(False)), absolute(xs))
+    with pytest.raises(KeyError, match='Missing static branch selector'):
+        eval_mox(mox, {}, xs)
+    with pytest.raises(ValueError, match='Unsupported value'):
+        eval_mox(mox, {}, xs, flag='bad')
+    with pytest.raises(TypeError, match='must be a Python str or bool'):
+        eval_mox(mox, {}, xs, flag=jnp.array(True))
+
+
+def test_selector_conflict_with_existing_non_static_kwarg():
+    def fn(xs, mode: bool = False):
+        if mode:
+            return jnp.abs(xs)
+        return -xs
+
+    xs = jnp.array([-1.0, 2.0])
+    mox = make_mox(fn)(xs, mode=False)
+    replacement = branch('mode', {
+        'neg': make_eq(negate),
+        'abs': make_eq(absolute),
+    })
+
+    with pytest.raises(RuntimeError, match='already exists'):
+        sub('//jit', replacement, mox)
+
+
+def test_parameterized_branch_cannot_replace_primitive():
+    xs = jnp.ones((2,))
+    mox = make_mox(negate)(xs)
+    replacement = branch('mode', {
+        'scale': module_case(Scale(), xs),
+        'plus': module_case(ScalePlus(), xs),
+    })
+
+    with pytest.raises(NotImplementedError, match='primitive Equation'):
+        sub('//jit', replacement, mox)
+
+
 def test_branch_query_and_dumps():
     xs = jnp.ones((2,))
     mox = pass_mox(xs)
@@ -282,3 +472,15 @@ def test_branch_query_and_dumps():
     dump_yson(mox, buf)
     obj = yt_yson.loads(buf.getvalue())
     assert b'static_branch' in yt_yson.dumps(obj)
+
+
+def test_sub_inside_existing_branch_case_is_unsupported():
+    xs = jnp.ones((2,))
+    mox = pass_mox(xs)
+    sub('//[@type="Pass"]', branch('mode', {
+        'neg': make_eq(negate),
+        'abs': make_eq(absolute),
+    }), mox)
+
+    with pytest.raises(NotImplementedError, match='inside static branch'):
+        sub('//jit', make_eq(absolute), mox)

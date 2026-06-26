@@ -387,6 +387,10 @@ def param_count(expr: Expr) -> int:
     return 0
 
 
+def param_symbols(expr: Expr) -> list[Symbol]:
+    return expr.inputs[:param_count(expr)]
+
+
 def external_inputs(expr: Expr) -> list[Symbol]:
     num_params = param_count(expr)
     if isinstance(expr, Branch):
@@ -402,7 +406,7 @@ def external_params(expr: Expr) -> list[Symbol]:
 
 
 def external_param_tree(expr: Expr) -> ArrayTree:
-    leaves = external_params(expr)
+    leaves = param_symbols(expr)
     match expr:
         case Equation():
             return {}
@@ -422,6 +426,14 @@ def set_external_inputs(expr: Expr, inputs: Sequence[Symbol]) -> None:
         expr.inputs = expr.inputs[:num_params + 1] + [*inputs]
     else:
         expr.inputs = expr.inputs[:num_params] + [*inputs]
+
+
+def expr_name(expr: Expr) -> str:
+    if name := expr.params.get('name'):
+        return name
+    if isinstance(expr, Mox) and expr.module_ty is not None:
+        return f'{expr.module_ty.__name__}_0'
+    return 'static_branch'
 
 
 def clone_symbol(sym: Symbol) -> Symbol:
@@ -517,9 +529,9 @@ def unwrap_key_path(kp: KeyPath) -> tuple[str, ]:
 
 
 def to_flat_dict(at: ArrayTree) \
-        -> tuple[dict[Key, Array], list[Key], PyTreeDef]:
+        -> tuple[dict[Key, Any], list[Key], PyTreeDef]:
     ix: list[Key] = []
-    res: dict[Key, Array] = {}
+    res: dict[Key, Any] = {}
 
     def fn_leaf(leaf: tuple[KeyPath, Any]):
         key = unwrap_key_path(leaf[0])
@@ -570,7 +582,7 @@ def reconstruct(flat_dict: Mapping[Key, Any]):
 
 
 def map_param_tree(fn: Callable[[Sequence[ArrayTree | None]], Any],
-                   trees: Sequence[ArrayTree] ) -> dict[str, Any]:
+                   trees: Sequence[ArrayTree]) -> dict[str, Any]:
     """Apply `fn` to all leaves of union of `trees`.
 
     >>> xs = {'params': {'kernel': jnp.eye(2)}}
@@ -599,7 +611,7 @@ def map_param_tree(fn: Callable[[Sequence[ArrayTree | None]], Any],
 
 def merge_branch_params(cases: Mapping[BranchKey, Expr]) \
         -> tuple[list[Symbol], PyTreeDef, dict[Symbol, Symbol]]:
-    """Merge case parameter symbols by variable path and symbol identity.
+    """Merge case parameter symbols by variable path.
 
     1. Restore param tree.
     2. Symbols at the same paths are the same symbols.
@@ -613,28 +625,43 @@ def merge_branch_params(cases: Mapping[BranchKey, Expr]) \
         param_tree = external_param_tree(expr)
         param_trees += [param_tree]
 
-    def fn(leaves: Sequence[ArrayTree | None]) -> ArrayTree:
-        symbols: Sequence[Symbol] = [x for x in leaves if x is not None]
-        if len(symbols) == 0:
-            raise RuntimeError(f'No array tree defined: {leaves}.')
-        symbol, *symbols = symbols
-        return symbol
-
-    # Build union tree of parameter trees.
-    params = map_param_tree(fn, param_trees)
-    leaves, treedef = jax.tree.flatten(params)
-
-    # Build mapping between shared symbols and branch arm symbols.
-    mapping: dict[Symbol, Symbol] = {}
-    flat_params, *_ = to_flat_dict(params)
+    # First validate the V1 ambiguity rule. MoX expressions refer to params by
+    # symbol, not path, so one symbol cannot safely stand for multiple runtime
+    # paths.
+    symbol_paths: dict[Symbol, KeyPath] = {}
+    path_symbols: dict[KeyPath, list[Symbol]] = defaultdict(list)
+    keys: list[KeyPath] = []
     for param_tree in param_trees:
-        flat_param_tree, *_ = to_flat_dict(param_tree)
-        for key, sym in flat_param_tree.items():
-            if (shared_sym := flat_params[key]) == sym:
-                continue
+        flat_param_tree, key_index, _ = to_flat_dict(param_tree)
+        for key in key_index:
+            sym = flat_param_tree[key]
+            if not isinstance(sym, Symbol):
+                raise RuntimeError(
+                    f'Expected a Symbol at parameter path {key}: {sym}.')
+            if (path := symbol_paths.get(sym)) is not None and path != key:
+                raise RuntimeError(
+                    f'Parameter symbol appears at multiple variable paths: '
+                    f'{path} and {key}.')
+            symbol_paths[sym] = key
+            if key not in path_symbols:
+                keys += [key]
+            path_symbols[key].append(sym)
+
+    shared_params: dict[KeyPath, Symbol] = {}
+    mapping: dict[Symbol, Symbol] = {}
+    for key in keys:
+        symbol, *symbols = path_symbols[key]
+        for sym in symbols:
+            validate_symbols([symbol], [sym], 'parameter')
+        shared_sym = clone_symbol(symbol)
+        shared_params[key] = shared_sym
+        for sym in [symbol] + symbols:
             mapping[sym] = shared_sym
 
-    # Then replace branch symbols with shared ones.
+    params = reconstruct(shared_params)
+    leaves, treedef = jax.tree.flatten(params)
+
+    # Then replace branch symbols with shared branch symbols.
     for _, expr in cases.items():
         replace_symbols(expr, mapping)
 
@@ -651,6 +678,7 @@ def branch(selector_name: str,
         raise ValueError('Static branch requires at least one case.')
 
     normalized: dict[BranchKey, Expr] = {}
+    memo: dict[Symbol, Symbol] = {}
     for key, expr in cases.items():
         norm_key = normalize_branch_key(key, selector_name=selector_name)
         if norm_key in normalized:
@@ -659,7 +687,7 @@ def branch(selector_name: str,
             raise TypeError(
                 f'Branch case {norm_key!r} must be an {type(Expr).__name__}, '
                 f'not {type(expr).__name__}.')
-        normalized[norm_key] = clone_expr(expr)
+        normalized[norm_key] = clone_expr(expr, memo)
 
     first_case = next(iter(normalized.values()))
     first_inputs = [*external_inputs(first_case)]
@@ -1427,6 +1455,8 @@ def map_mox(fn: Callable[[Expr], Any], tree: Mox):
         node: Expr = nodes.pop()
         if isinstance(res := fn(node), Mox):
             nodes += reversed(res.children)
+        elif isinstance(res, Branch):
+            nodes += reversed(tuple(res.cases.values()))
 
 
 ModulePath: TypeAlias = tuple[str, ...]
@@ -1436,8 +1466,8 @@ ModulePath: TypeAlias = tuple[str, ...]
 SubFn: TypeAlias = Callable[[ModulePath, Expr], Expr]
 
 
-def sub(expr: str | XPath | Sequence[Equation | Mox],
-        repl: Mox | Equation | SubFn, mox: Mox) -> Mox:
+def sub(expr: str | XPath | Sequence[Equation | Mox | Branch],
+        repl: Mox | Equation | Branch | SubFn, mox: Mox) -> Mox:
     """Substitute a module expression `mox` with `repl` according to matching
     pattern `expr`.
 
@@ -1455,10 +1485,7 @@ def sub(expr: str | XPath | Sequence[Equation | Mox],
         which is not deepcopy-able. This is why we shallow-copy `repl` and
         create new symbols.
         """
-        obj = copy(repl)
-        obj.inputs = [type(s)(s.value) for s in repl.inputs]
-        obj.outputs = [type(s)(s.value) for s in repl.outputs]
-        return obj
+        return clone_expr(repl)
 
     sub_fn: SubFn
     if isinstance(repl, Expr):
@@ -1470,12 +1497,12 @@ def sub(expr: str | XPath | Sequence[Equation | Mox],
 
     # Our substitution algorithm is quite straight forward: find nodes of
     # interest, verify type integrity, search parents, and finally replace.
-    nodes: list[Equation | Mox] = []
+    nodes: list[Equation | Mox | Branch] = []
     if isinstance(expr, list | tuple):
         nodes.extend(expr)
     else:
         for node in query(expr, mox):
-            if not isinstance(node, Equation | Mox):
+            if not isinstance(node, Equation | Mox | Branch):
                 raise RuntimeError(
                     f'XPath expression does not select a node: {expr}.')
             nodes += [node]
@@ -1483,9 +1510,12 @@ def sub(expr: str | XPath | Sequence[Equation | Mox],
     for node in nodes:
         if not (parents := find_parents(mox, node)):
             raise RuntimeError(f'No parent found for node {node}.')
+        if any(isinstance(parent, Branch) for parent in parents):
+            raise NotImplementedError(
+                'Substitution inside static branch cases is not supported.')
         path = tuple([p.params.get('name') or p.module_ty.__name__
-                      for p in parents[1:]])
-        path += (node.params.get('name') or node.module_ty.__name__, )
+                      for p in parents[1:] if isinstance(p, Mox)])
+        path += (expr_name(node), )
         if (new_node := sub_fn(path, node)) is node:
             continue
         sub_node(mox, node, new_node)
@@ -1493,11 +1523,20 @@ def sub(expr: str | XPath | Sequence[Equation | Mox],
     return mox
 
 
-def sub_node(mox: Mox, node: Expr, repl: Equation | Mox):
+def sub_node(mox: Mox, node: Expr, repl: Equation | Mox | Branch):
     if not (parents := find_parents(mox, node)):
         raise RuntimeError(f'No parent found for node {node}.')
+    if any(isinstance(parent, Branch) for parent in parents):
+        raise NotImplementedError(
+            'Substitution inside static branch cases is not supported.')
+    if (isinstance(node, Equation) and isinstance(repl, Branch)
+            and param_count(repl)):
+        raise NotImplementedError(
+            'Parameterized Branch replacement of a primitive Equation is not '
+            'supported.')
 
     *_, parent = parents
+    assert isinstance(parent, Mox)
     for ix, child in enumerate(parent.children):
         if child is node:
             break
@@ -1505,18 +1544,31 @@ def sub_node(mox: Mox, node: Expr, repl: Equation | Mox):
         raise RuntimeError(
             f'There is no node {node} among childrens of {parent}.')
 
+    if (isinstance(repl, Branch) and not repl.params.get('name')
+            and node.params.get('name')):
+        repl.params['name'] = node.params.get('name')
     rewire_node(node, repl)
+    if isinstance(repl, Branch):
+        ensure_root_static_kwarg(mox, repl)
     update_in_trees(parents, ix, repl)
     update_var_trees(parents, ix, repl)
     parent.children[ix] = repl
 
 
-def find_parents(root: Expr, node: Expr) -> tuple[Mox, ...]:
+def find_parents(root: Expr, node: Expr) -> tuple[Expr, ...] | None:
     # TODO(@daskol): We should get rid of `find_parents` and add `parent`
     # reference to `Expr` type.
     match root:
         case Equation():
             return None
+        case Branch():
+            for expr in root.cases.values():
+                if expr is node:
+                    return (root, )
+            for expr in root.cases.values():
+                parents = find_parents(expr, node)
+                if parents is not None:
+                    return (root, ) + parents
         case Mox():
             # Try to find `node` in childrens.
             for expr in root.children:
@@ -1529,18 +1581,33 @@ def find_parents(root: Expr, node: Expr) -> tuple[Mox, ...]:
                     return (root, ) + parents
 
 
-def rewire_node(node: Expr, repl: Expr):
-    if isinstance(node, Equation):
-        node_inputs = node.inputs
-    elif isinstance(node, Mox):
-        node_inputs = node.inputs[node.var_tree.num_leaves:]
+def ensure_root_static_kwarg(root: Mox, node: Branch) -> None:
+    args, kwargs = root.in_tree.unflatten(root.inputs)
+    if node.selector_name in kwargs:
+        selector = kwargs[node.selector_name]
+        if not isinstance(selector, Static):
+            raise RuntimeError(
+                f'Root kwarg {node.selector_name!r} already exists and is '
+                'not a Static selector.')
+        set_branch_selector(node, selector)
+        return
+    kwargs[node.selector_name] = node.selector
+    root.inputs, root.in_tree = jax.tree.flatten((args, kwargs))
 
-    if isinstance(repl, Equation):
-        repl_params = []
-        repl_inputs = repl.inputs
-    elif isinstance(repl, Mox):
-        repl_params = repl.inputs[:repl.var_tree.num_leaves]
-        repl_inputs = repl.inputs[repl.var_tree.num_leaves:]
+
+def set_branch_selector(node: Branch, selector: Static) -> None:
+    num_params = node.var_tree.num_leaves
+    old_selector = node.inputs[num_params]
+    node.selector = selector
+    node.inputs[num_params] = selector
+    replace_symbols(node, {old_selector: selector})
+
+
+def rewire_node(node: Expr, repl: Expr):
+    node_inputs = external_inputs(node)
+
+    repl_params = param_symbols(repl)
+    repl_inputs = external_inputs(repl)
     repl_aux_inputs = repl_inputs[len(node_inputs):]
 
     # Check types of output symbols and preserved input symbols.
@@ -1549,26 +1616,32 @@ def rewire_node(node: Expr, repl: Expr):
 
     # If there are some input symbols then we preserve as many input symbols as
     # possible.
-    repl.inputs = repl_params + node_inputs + repl_aux_inputs
-    repl.outputs = node.outputs
+    new_inputs = node_inputs + repl_aux_inputs
+    if isinstance(repl, Branch):
+        mapping = dict(zip(repl_inputs, new_inputs))
+        mapping.update(zip(repl.outputs, node.outputs))
+        replace_symbols(repl, mapping)
+        set_external_inputs(repl, new_inputs)
+        repl.outputs = node.outputs
+    else:
+        repl.inputs = repl_params + new_inputs
+        repl.outputs = node.outputs
 
 
-def update_in_trees(parents: tuple[Mox, ...], ix: int, repl: Mox):
+def update_in_trees(parents: tuple[Expr, ...], ix: int,
+                    repl: Equation | Mox | Branch):
     orig = parents[-1].children[ix]
-    arity = len(orig.inputs)
-    if isinstance(orig, Mox):
-        arity -= orig.var_tree.num_leaves
+    assert isinstance(orig, Expr)
+    arity = len(external_inputs(orig))
 
-    if isinstance(repl, Equation):
-        repl_inputs = repl.inputs
-    elif isinstance(repl, Mox):
-        repl_inputs = repl.inputs[repl.var_tree.num_leaves:]
+    repl_inputs = external_inputs(repl)
     orig_syms, aux_syms = repl_inputs[:arity], repl_inputs[arity:]
-    if orig.inputs[-arity:] != orig_syms:
+    if external_inputs(orig) != orig_syms:
         raise NotImplementedError(
             'Original input symbols must be preserved at the moment.')
 
     for offset, p in enumerate(reversed(parents)):
+        assert isinstance(p, Mox)
         p.entrypoint = None  # Mark as an ephemeral.
 
         # The first input in the root node is a proper param dict, not a
@@ -1589,18 +1662,20 @@ def update_in_trees(parents: tuple[Mox, ...], ix: int, repl: Mox):
             'Weight params symbols are not preserved.'
 
 
-def update_var_trees(parents: tuple[Mox, ...], ix: int, repl: Mox):
+def update_var_trees(parents: tuple[Expr, ...], ix: int,
+                     repl: Equation | Mox | Branch):
     # Only module expressions have param tree.
-    if not isinstance(repl, Mox):
+    if not param_count(repl):
         return
 
     orig = parents[-1].children[ix]
     orig_name = orig.params.get('name')
     for p in reversed(parents[1:]):
+        assert isinstance(p, Mox)
         # Restore child tree.
-        num_params = repl.var_tree.num_leaves
+        num_params = param_count(repl)
         repl_vars = repl.var_tree.unflatten(repl.inputs[:num_params])
-        repl_name = repl.params.get('name') or f'{repl.module_ty.__name__}_0'
+        repl_name = expr_name(repl)
 
         # Restore parent tree.
         num_params = p.var_tree.num_leaves
@@ -1637,21 +1712,27 @@ def update_var_trees(parents: tuple[Mox, ...], ix: int, repl: Mox):
         repl = p
 
     # Restore child var-tree.
-    num_params = repl.var_tree.num_leaves
+    num_params = param_count(repl)
     repl_vars = repl.var_tree.unflatten(repl.inputs[:num_params])
-    repl_name = repl.params.get('name') or f'{repl.module_ty.__name__}_0'
+    repl_name = expr_name(repl)
 
     # Restore root in-tree.
     root = parents[0]
+    assert isinstance(root, Mox)
     (variables, *inputs), kwargs = root.in_tree.unflatten(root.inputs)
 
     # Update in-place root params.
     if 'params' not in variables:
         variables['params'] = {}
     variables['params'].pop(orig_name, None)
-    assert repl_name not in variables['params'], \
-        'Duplicated key in variables: fix name generation or fix a tree.'
-    variables['params'].update(repl_vars['params'])
+    if isinstance(repl, Branch):
+        assert repl_name not in variables['params'], \
+            'Duplicated key in variables: fix name generation or fix a tree.'
+        variables['params'][repl_name] = repl_vars.get('params', {})
+    else:
+        assert repl_name not in variables['params'], \
+            'Duplicated key in variables: fix name generation or fix a tree.'
+        variables['params'].update(repl_vars['params'])
     args = (variables, *inputs)
     root.inputs, root.in_tree = jax.tree.flatten((args, kwargs))
 
