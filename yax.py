@@ -1355,6 +1355,36 @@ def eval_equation(read, write, eq: Equation):
         write(sym, val)
 
 
+def eval_branch(read, write, node: Branch):
+    try:
+        selector = read(node.selector)
+    except KeyError as e:
+        raise KeyError(
+            f'Missing static branch selector {node.selector_name!r}.') from e
+    key = normalize_branch_key(selector, selector_name=node.selector_name)
+    if key not in node.cases:
+        available = ', '.join(repr(k) for k in node.cases)
+        raise ValueError(
+            f'Unsupported value {selector!r} for static branch selector '
+            f'{node.selector_name!r}; available cases are: {available}.')
+    eval_expr(read, write, node.cases[key])
+
+
+def eval_expr(read, write, node: Expr):
+    if isinstance(node, Mox):
+        if node.is_ephemeral:
+            for child in node.children:
+                eval_expr(read, write, child)
+        else:
+            eval_module(read, write, node)
+    elif isinstance(node, Branch):
+        eval_branch(read, write, node)
+    elif isinstance(node, Equation):
+        eval_equation(read, write, node)
+    else:
+        raise RuntimeError(f'Unexpected expression type {type(node)}.')
+
+
 def eval_mox(tree: Mox, *args, **kwargs):
     """Evaluate a module expression `tree` with `args` and `kwargs`."""
     env: dict[Symbol, Any] = {}
@@ -1371,21 +1401,18 @@ def eval_mox(tree: Mox, *args, **kwargs):
         assert var not in env, f'Variable {var} has been already defined.'
         env[var] = val
 
-    def fn(node: Expr) -> Mox | None:
-        if isinstance(node, Mox):
-            if node.is_ephemeral:
-                return node
-            else:
-                return eval_module(read, write, node)
-        elif isinstance(node, Equation):
-            return eval_equation(read, write, node)
+    # Verify presence of necessary static arguments.
+    for node in query('//static_branch', tree):
+        if isinstance(node, Branch) and node.selector_name not in kwargs:
+            raise KeyError(
+                f'Missing static branch selector {node.selector_name!r}.')
 
     # Initialize execution context and execute.
     flat_args, in_tree = jax.tree.flatten((args, kwargs))
     assert in_tree == tree.in_tree, \
         f'Arguments and input tree mismatched: {in_tree} vs {tree.in_tree}.'
     jax.tree.map(write, tree.inputs, flat_args)
-    map_mox(fn, tree)
+    eval_expr(read, write, tree)
 
     flatten_res = [read(x) for x in tree.outputs]
     if len(flatten_res) == 1:
