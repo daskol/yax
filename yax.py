@@ -291,6 +291,9 @@ class Expr:
     outputs: list[Symbol]
     params: dict[str, Any]
 
+    def to_dict(self) -> dict[str, Any]:
+        raise NotImplementedError
+
 
 @dataclass(slots=True)
 class Equation(Expr):
@@ -365,13 +368,7 @@ class Mox(Expr):
         if recursively:
             children = []
             for child in self.children:
-                if isinstance(child, Mox):
-                    children.append(child.to_dict())
-                elif isinstance(child, Equation):
-                    children.append({
-                        **child.params, 'primitive':
-                        child.prim.name
-                    })
+                children.append(child.to_dict())
             res['children'] = children
         return res
 
@@ -879,18 +876,28 @@ def dump(node: Expr, fileobj: IO[str], *, depth=0):
                 attrs = ''
             print(f'{indent}mod {name} : {name_ty}({attrs}) {{ # {depth}',
                   file=fileobj)
+            for child in node.children:
+                dump(child, fileobj, depth=depth + 1)
+            print(f'{indent}}}', file=fileobj)
+        case Branch():
+            keys = ', '.join(repr(k) for k in node.cases)
+            print(f'{indent}inputs ={node.inputs}', file=fileobj)
+            print(f'{indent}outputs={node.outputs}', file=fileobj)
+            print(f'{indent}branch {node.params.get("name")} : '
+                  f'static_branch(selector={node.selector_name}, '
+                  f'cases=({keys})) {{ # {depth}', file=fileobj)
+            for key, case in node.cases.items():
+                print(f'{indent}  case {key!r} {{', file=fileobj)
+                dump(case, fileobj, depth=depth + 2)
+                print(f'{indent}  }}', file=fileobj)
+            print(f'{indent}}}', file=fileobj)
+        case Equation():
+            print(f'{indent}eq {node.prim.name}', file=fileobj)
+            print(f'{indent}inputs ={node.inputs}', file=fileobj)
+            print(f'{indent}outputs={node.outputs}', file=fileobj)
+            print(f'{indent}{node}', file=fileobj)
         case Expr():
             raise RuntimeError('Unexpected node of type {type(node)}.')
-    for child in node.children:
-        match child:
-            case Mox():
-                dump(child, fileobj, depth=depth + 1)
-            case Equation():
-                print(f'{indent}  eq {child.prim.name}', file=fileobj)
-                print(f'{indent}  inputs ={child.inputs}', file=fileobj)
-                print(f'{indent}  outputs={child.outputs}', file=fileobj)
-                print(f'{indent}  {child}', file=fileobj)
-    print(f'{indent}}}', file=fileobj)
 
 
 def dump_yson(expr: Expr, fileobj: IO[bytes], indent: int = 2):
@@ -928,6 +935,14 @@ def dump_yson(expr: Expr, fileobj: IO[bytes], indent: int = 2):
             if expr.module_ty:
                 root.attributes['type'] = expr.module_ty.__name__
             root.extend(to_yson(child) for child in expr.children)
+        elif isinstance(expr, Branch):
+            root = YsonList([])
+            root.attributes['primitive'] = 'static_branch'
+            root.attributes['selector'] = expr.selector_name
+            for key, case in expr.cases.items():
+                child = to_yson(case)
+                child.attributes['case'] = fmt(key)
+                root.append(child)
         elif isinstance(expr, Equation):
             root = YsonEntity()
             root.attributes['primitive'] = expr.prim.name
@@ -963,14 +978,21 @@ def dump_xml(expr: Expr, fileobj: IO[str], indent: int = 2):
         else:
             return str(val)
 
-    def build_subtree(parent: Element, node: Expr):
+    def build_subtree(parent: Element, node: Expr,
+                      case: BranchKey | None = None):
         attrs = {}
         if isinstance(node, Mox):
             tag = 'module_call'
-            attrs['type'] = node.module_ty.__name__
+            if node.module_ty:
+                attrs['type'] = node.module_ty.__name__
             attrs['ephemeral'] = fmt(node.is_ephemeral)
+        elif isinstance(node, Branch):
+            tag = 'static_branch'
+            attrs['selector'] = node.selector_name
         elif isinstance(node, Equation):
             tag = node.prim.name
+        if case is not None:
+            attrs['case'] = fmt(case)
         attrs.update({
             k: fmt(v)
             for k, v in node.params.items() if v is not None
@@ -979,11 +1001,19 @@ def dump_xml(expr: Expr, fileobj: IO[str], indent: int = 2):
         if isinstance(node, Mox):
             for child in node.children:
                 build_subtree(elem, child)
+        elif isinstance(node, Branch):
+            for key, child in node.cases.items():
+                build_subtree(elem, child, key)
 
     if isinstance(expr, Mox):
         root = Element('module_call', attrib={'ephemeral': 'true'})
         for child in expr.children:
             build_subtree(root, child)
+    elif isinstance(expr, Branch):
+        root = Element('static_branch',
+                       attrib={'selector': expr.selector_name})
+        for key, child in expr.cases.items():
+            build_subtree(root, child, key)
     elif isinstance(expr, Equation):
         root = Element(expr.prim.name, attrib={})
     else:

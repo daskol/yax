@@ -13,7 +13,9 @@
 # limitations under the License.
 
 from collections.abc import Mapping
+from io import BytesIO, StringIO
 from typing import Type, cast
+from xml.etree import ElementTree
 
 import flax.linen as nn
 import jax
@@ -174,3 +176,48 @@ def test_branch_boundary_validation():
 
     with pytest.raises(RuntimeError, match='output symbol shapes differ'):
         branch('mode', {'a': make_eq(), 'b': make_eq(first)})
+
+
+def test_dump():
+    expr = make_eq()
+    node = branch('mode', {np.bool_(True): expr, False: expr})
+    buf = StringIO()
+    dump(node, buf)
+    output = buf.getvalue()
+
+    # inputs =[Static(value='mode'), ...]
+    # outputs=[...]
+    # branch None : static_branch(selector=mode, cases=(True, False)) { # 0
+    #   case True { ... }
+    #   case False { ... }
+    # }
+    assert 'Static' in output
+    assert '\'mode\'' in output
+    assert 'branch' in output
+    assert 'static_branch' in output
+    assert 'case False {' in output
+    assert 'case True {' in output
+
+
+def test_dump_xml():
+    expr = make_eq()
+    node = branch('mode', {np.bool_(True): expr, False: expr})
+    buf = StringIO()
+    dump_xml(node, buf)
+    root = ElementTree.fromstring(buf.getvalue())
+    assert root.tag == 'static_branch'
+    assert root.attrib['selector'] == 'mode'
+
+
+def test_dump_yson():
+    yt_yson = pytest.importorskip('yt.yson')
+
+    expr = make_eq()
+    node = branch('mode', {np.bool_(True): expr, False: expr})
+    buf = BytesIO()
+
+    dump_yson(node, buf)
+    obj = yt_yson.loads(buf.getvalue())
+    assert obj.attributes['primitive'] == 'static_branch'
+    assert obj.attributes['selector'] == 'mode'
+    assert len(obj) == 2
