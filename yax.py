@@ -407,6 +407,8 @@ def external_params(expr: Expr) -> list[Symbol]:
 def external_param_tree(expr: Expr) -> ArrayTree:
     leaves = external_params(expr)
     match expr:
+        case Equation():
+            return {}
         case Mox():
             node = cast(Mox, expr)
         case Branch():
@@ -414,8 +416,7 @@ def external_param_tree(expr: Expr) -> ArrayTree:
         case _:
             raise RuntimeError(
                 f'No treedef for an object of type {type(expr).__name__}.')
-    params = jax.tree.unflatten(node.var_tree, params)
-    return params
+    return jax.tree.unflatten(node.var_tree, leaves)
 
 
 def set_external_inputs(expr: Expr, inputs: Sequence[Symbol]) -> None:
@@ -511,7 +512,7 @@ def unwrap_key_path(kp: KeyPath) -> tuple[str, ]:
             case DictKey():
                 parts.append(part.key)
             case SequenceKey():
-                parts.append(part.id)
+                parts.append(part.idx)
             case _:
                 raise RuntimeError(
                     f'Unexpected type of key part: {type(part)}.')
@@ -551,7 +552,8 @@ def reconstruct(flat_dict: Mapping[Key, Any]):
     >>> reconstruct({(0, 'a'): 1, (0, 'b'): 2, (1, 'a'): 3})
     [{'a': 1, 'b': 2}, {'a': 3}]
     """
-
+    if flat_dict == {}:
+        return {}
     if () in flat_dict and len(flat_dict) == 1:
         return flat_dict[()]  # Leaf.
     elif () in flat_dict:
@@ -600,8 +602,46 @@ def map_param_tree(fn: Callable[[Sequence[ArrayTree | None]], Any],
 
 def merge_branch_params(cases: Mapping[BranchKey, Expr]) \
         -> tuple[list[Symbol], PyTreeDef, dict[Symbol, Symbol]]:
-    """Merge case parameter symbols by variable path and symbol identity."""
-    raise NotImplementedError
+    """Merge case parameter symbols by variable path and symbol identity.
+
+    1. Restore param tree.
+    2. Symbols at the same paths are the same symbols.
+    3. Merge variable trees.
+       {/a: s1} + {/a: s2} -> {/a: Sa}
+       {/a: s1} + {/b: s2} -> {/a: Sa, /b: Sb}
+       {/a: s1, /b: s1} + {/a: s2, /c: s2} -> error: s1 at both /a and /b
+    """
+    param_trees = []
+    for _, expr in cases.items():
+        param_tree = external_param_tree(expr)
+        param_trees += [param_tree]
+
+    def fn(leaves: Sequence[ArrayTree | None]) -> ArrayTree:
+        symbols: Sequence[Symbol] = [x for x in leaves if x is not None]
+        if len(symbols) == 0:
+            raise RuntimeError(f'No array tree defined: {leaves}.')
+        symbol, *symbols = symbols
+        return symbol
+
+    # Build union tree of parameter trees.
+    params = map_param_tree(fn, param_trees)
+    leaves, treedef = jax.tree.flatten(params)
+
+    # Build mapping between shared symbols and branch arm symbols.
+    mapping: dict[Symbol, Symbol] = {}
+    flat_params, *_ = to_flat_dict(params)
+    for param_tree in param_trees:
+        flat_param_tree, *_ = to_flat_dict(param_tree)
+        for key, sym in flat_param_tree.items():
+            if (shared_sym := flat_params[key]) == sym:
+                continue
+            mapping[sym] = shared_sym
+
+    # Then replace branch symbols with shared ones.
+    for _, expr in cases.items():
+        replace_symbols(expr, mapping)
+
+    return leaves, treedef, mapping
 
 
 def branch(selector_name: str,

@@ -13,14 +13,18 @@
 # limitations under the License.
 
 from collections.abc import Mapping
+from typing import Type, cast
 
 import flax.linen as nn
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from numpy.testing import assert_array_equal
 
-from yax import Static, branch, make_mox, map_param_tree, reconstruct
+from yax import (
+    ShapedArray, Static, Symbol, branch, make_mox, map_param_tree,
+    merge_branch_params, reconstruct)
 
 
 def absolute(xs):
@@ -60,8 +64,23 @@ class Scale(nn.Module):
 
     @nn.compact
     def __call__(self, xs):
-        scale = self.param('scale', nn.initializers.ones, xs.shape)
-        return xs * scale
+        *_, features = xs.shape
+        kernel = self.param('scale', nn.initializers.ones, (features, ) * 2)
+        return xs @ kernel
+
+
+class Shift(nn.Module):
+
+    @nn.compact
+    def __call__(self, xs):
+        *_, features = xs.shape
+        shift = self.param('shift', nn.initializers.ones, (features, ))
+        return xs + shift
+
+
+def test_reconstruct_empty():
+    res = reconstruct({})
+    assert res == {}
 
 
 def test_reconstruct_dict_dict():
@@ -102,6 +121,33 @@ def test_map_param_tree():
     res = map_param_tree(fn, (xs, ys))
     assert_array_equal(res['params']['kernel'], xs['params']['kernel'])
     assert_array_equal(res['params']['bias'], ys['params']['bias'])
+
+
+def test_merge_branch_params():
+    xs = jnp.empty((2, ))
+
+    def make_expr(module_ty: Type[nn.Module]):
+        module = module_ty()
+        params = module.init(jax.random.key(42), xs)
+        mox = make_mox(module.apply)(params, xs)
+        return mox.children[0]
+
+    scale = make_expr(Scale)
+    shift = make_expr(Shift)
+
+    leaves, treedef, mappings = \
+        merge_branch_params({np.bool_(True): scale, False: shift})
+    variables = jax.tree.unflatten(treedef, leaves)
+
+    symbol: Symbol = variables['params']['scale']
+    value: ShapedArray = cast(ShapedArray, symbol.value)
+    assert value.shape == (2, 2)
+    assert value.dtype == jnp.float32
+
+    symbol: Symbol = variables['params']['shift']
+    value: ShapedArray = cast(ShapedArray, symbol.value)
+    assert value.shape == (2, )
+    assert value.dtype == jnp.float32
 
 
 def test_branch_key_normalization():
