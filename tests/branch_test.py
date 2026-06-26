@@ -179,7 +179,7 @@ def test_merge_branch_params():
     scale = make_expr(Scale)
     shift = make_expr(Shift)
 
-    leaves, treedef, mappings = \
+    leaves, treedef, _ = \
         merge_branch_params({np.bool_(True): scale, False: shift})
     variables = jax.tree.unflatten(treedef, leaves)
 
