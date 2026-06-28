@@ -303,6 +303,24 @@ def test_only_selected_case_runs_with_shared_outputs():
     assert_allclose(eval_mox(mox, {}, xs, mode='abs'), absolute(xs))
 
 
+def test_branch_jittable():
+    xs = jnp.array([-1.0, 2.0])
+    mox = pass_mox(xs)
+    replacement = branch('mode', {
+        'neg': make_eq(negate),
+        'abs': make_eq(absolute),
+    })
+    sub('//[@type="Pass"]', replacement, mox)
+
+    def apply(params, xs, *, mode: str):
+        return eval_mox(mox, params, xs, mode=mode)
+
+    apply = jax.jit(apply, static_argnames=('mode', ))
+
+    assert_allclose(apply({}, xs, mode='neg'), negate(xs))
+    assert_allclose(apply({}, xs, mode='abs'), absolute(xs))
+
+
 def test_shared_parameter_path_uses_one_runtime_leaf():
     xs = jnp.ones((2,))
     replacement = branch('mode', {
